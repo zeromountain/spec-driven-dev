@@ -1,0 +1,17 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "spec-driven-dev",
+  "description": "Spec-Driven Development(SDD) 하네스를 어느 프로젝트에나 깔아주는 마켓플레이스. 명세를 소스 오브 트루스로 두고, Spec Architect·Software Engineer·Review Agent 세 역할을 서브에이전트와 페이즈 게이트 훅으로 분리 집행한다.",
+  "owner": {
+    "name": "zeromountain",
+    "url": "https://github.com/zeromountain"
+  },
+  "plugins": [
+    {
+      "name": "sdd",
+      "description": "명세를 소스 오브 트루스로 삼아 개발하는 Spec-Driven Development 하네스. /sdd:init 으로 specs/·AGENTS.md·세 역할 서브에이전트·선택적 페이즈 게이트를 스캐폴딩하고, /sdd:run 으로 Spec Architect → Software Engineer → Review Agent 파이프라인을 돌린다.",
+      "source": "./",
+      "category": "productivity"
+    }
+  ]
+}

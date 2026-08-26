@@ -1,0 +1,17 @@
+{
+  "description": "SDD 페이즈 게이트 — 프로젝트가 .sdd/state.json 에서 enforce:true 로 opt-in 했을 때만 Write/Edit/MultiEdit/NotebookEdit 을 현재 페이즈(spec/implement/review)에 맞게 차단한다. opt-in 하지 않은 프로젝트에서는 항상 무동작이다.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Write|Edit|MultiEdit|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/phase_gate.py\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "name": "sdd",
+  "version": "0.2.0",
+  "description": "Spec-Driven Development 실행 하네스: 명세를 소스 오브 트루스로 삼아 Spec Architect·Software Engineer·Review Agent 세 역할을 분리하고, 페이즈 게이트 훅으로 각 역할의 쓰기 범위를 강제한다.",
+  "author": {
+    "name": "zeromountain",
+    "url": "https://github.com/zeromountain"
+  },
+  "homepage": "https://github.com/zeromountain/spec-driven-dev",
+  "repository": "https://github.com/zeromountain/spec-driven-dev",
+  "license": "MIT"
+}
