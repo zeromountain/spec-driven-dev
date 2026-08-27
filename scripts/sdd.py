@@ -2125,6 +2125,39 @@ def _advance_review(root: Path, pipe: dict, result: dict) -> None:
                 "approved 또는 changes-requested 여야 한다")
 
 
+def _run_all(root: Path, pipes: dict, resume: bool = False) -> dict:
+    """살아 있는 파이프라인 전부를 대상으로 배치 루프를 연다.
+
+    `--resume` 을 함께 주면 halted 인 것들도 되살린다 — 단계별 재시도 예산은 돌아오고,
+    전체 전이 상한(steps)은 계속 누적된다."""
+    revived = []
+    if resume:
+        for slug, pipe in sorted(pipes.items()):
+            if pipe.get("status") != "halted":
+                continue
+            pipe["status"] = "running"
+            pipe["haltReason"] = None
+            pipe["attempts"] = {k: 0 for k in pipe["attempts"]}
+            _record(pipe, "revived")
+            _persist_pipeline(root, pipe, focus=False)
+            revived.append(slug)
+
+    brd = board(root)
+    if not brd["counts"]["live"]:
+        halted = [r["slug"] for r in brd["pipelines"] if r["scheduled"] == "halted"]
+        return {"ok": False, "all": True, "board": brd,
+                "reason": ("멈춰 있는 파이프라인만 있다 — `run --all --resume` 으로 되살려라"
+                           if halted else
+                           "진행 중인 파이프라인이 없다 — `run \"<기능 설명>\"` 으로 시작하라")}
+
+    return {"ok": True, "all": True, "revived": revived, "board": brd,
+            "live": brd["counts"]["live"],
+            "next": compute_next_all(root),
+            "then": "next 의 round[] 를 한 메시지에서 동시에 호출하고, 각 결과를 "
+                    "`advance --spec <슬러그>` 로 따로 넘긴 뒤 `next --all` 로 다음 라운드를 "
+                    "연다. round 가 빌 때까지 반복한다"}
+
+
 def cmd_run(args) -> dict:
     root = Path(args.path).resolve()
     if not (root / ".sdd" / "state.json").exists():
@@ -2135,6 +2168,10 @@ def cmd_run(args) -> dict:
     pipes = load_pipelines(state)
     feature = (getattr(args, "feature", None) or "").strip()
     explicit = getattr(args, "spec", None)
+    all_mode = getattr(args, "all", False)
+
+    if all_mode and not feature:
+        return _run_all(root, pipes, resume=bool(getattr(args, "resume", False)))
 
     # 새 기능이면 그 슬러그의 파이프라인을 본다. 다른 기능이 돌고 있어도 막지 않는다 —
     # 여러 기능을 동시에 진행하는 것이 이 레지스트리의 목적이다.
@@ -2193,6 +2230,11 @@ def cmd_run(args) -> dict:
                         "agentCount": sum(len(v) for v in d["agents"].values())},
               "next": compute_next(root, slug)}
     brd = board(root)
+    if all_mode:
+        result["all"] = True
+        result["board"] = brd
+        result["next"] = compute_next_all(root)
+        return result
     if brd["counts"]["live"] > 1:
         result["board"] = brd
         result["note"] = (f"파이프라인 {brd['counts']['live']}개가 함께 살아 있다 — "
@@ -2407,6 +2449,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help="자동 깊이 판정을 덮어쓴다 (파이프라인 내내 유지된다)")
     sp.add_argument("--spec", default=None,
                     help="재개할 파이프라인 슬러그 (여러 개가 살아 있을 때)")
+    sp.add_argument("--all", action="store_true",
+                    help="살아 있는 파이프라인 전부를 대상으로 배치 루프를 연다 "
+                         "(--resume 과 함께 주면 halted 인 것도 되살린다)")
     sp.set_defaults(func=cmd_run)
 
     sp = sub.add_parser("next", help="다음 행동을 지시한다 (--all 이면 동시 실행 가능한 전부)")

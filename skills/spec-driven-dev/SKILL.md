@@ -74,6 +74,7 @@ PreToolUse 훅이 페이즈 경계를 실제로 막는다. 진행 위치와 **�
 | init | `/sdd:init` | `sdd.py init` → 스캐폴딩, AGENTS.md 병합, 하드 게이트 여부 확인 |
 | run | `/sdd:run <설명> [--deep\|--light]` | 파이프라인 시작 → **next/advance 루프**를 끝까지 돌린다 |
 | resume | `/sdd:run` (인자 없이) | 중단된 파이프라인을 그 자리에서 재개 |
+| run-all | `/sdd:run --all` | 살아 있는 파이프라인 **전부**를 배치 루프로 끝까지 돌린다 |
 | board | `/sdd:board` | 살아 있는 파이프라인 전부의 위치·실행 가능 여부 |
 | spec / implement / review | `/sdd:spec` 등 | 루프를 **한 번만** 돌린다 (수동 스텝) |
 | audit | `/sdd:audit [슬러그]` | `spec-auditor`만 단독 호출 (파이프라인 밖에서 명세만 재검토) |
@@ -150,10 +151,14 @@ $S/sdd.py run "<기능 설명>" --path <root>
 ```bash
 $S/sdd.py run "프로필 이미지 업로드" --path <root>
 $S/sdd.py run "결제 취소 정책" --path <root>     # 막히지 않는다
-$S/sdd.py next --all --path <root>               # 이번 라운드에 동시에 할 것
+$S/sdd.py run --all --path <root>                # 전부를 대상으로 배치 루프를 연다
 ```
 
-`next --all`이 `action: "batch"`를 내면 **`round[]`의 행동들을 한 메시지에서 동시에
+`run --all`은 살아 있는 것 전부를 대상으로 잡고 첫 라운드까지 돌려준다. `--resume`을 함께
+주면 `halted`인 파이프라인도 되살린다. 인자 없는 `/sdd:run`은 **하나만**(마지막에 손댄 것)
+재개하므로, 여러 개를 함께 돌리려면 `--all`을 붙인다.
+
+이후 라운드는 `$S/sdd.py next --all`로 연다. `action: "batch"`를 내면 **`round[]`의 행동들을 한 메시지에서 동시에
 호출한다.** 스케줄러가 이미 안전을 확인한 목록이므로 네가 다시 판단하지 않는다. 각 결과는
 `advance --spec <슬러그>`로 **따로** 넘긴다.
 

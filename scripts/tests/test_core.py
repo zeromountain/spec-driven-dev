@@ -445,7 +445,8 @@ def _run(root: Path, feature=None, **kw):
     return sdd.cmd_run(_ns(path=str(root), feature=feature, slug=kw.get("slug"),
                            resume=kw.get("resume", False), restart=kw.get("restart", False),
                            max_attempts=kw.get("max_attempts", sdd.DEFAULT_MAX_ATTEMPTS),
-                           depth=kw.get("depth"), spec=kw.get("spec")))
+                           depth=kw.get("depth"), spec=kw.get("spec"),
+                           all=kw.get("all", False)))
 
 
 def _next(root: Path, spec=None, all=False):
@@ -1154,6 +1155,50 @@ class ParallelPipelineTests(unittest.TestCase):
             out = sdd.cmd_abort(_ns(path=str(root), reason="정리", spec=None, all=True))
             self.assertEqual(sorted(out["aborted"]), ["기능-둘", "기능-하나"])
             self.assertEqual(sdd.board(root)["counts"]["live"], 0)
+
+    def test_run_all_opens_the_batch_loop(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._two(tmp)
+            out = _run(root, all=True)
+            self.assertTrue(out["ok"])
+            self.assertTrue(out["all"])
+            self.assertEqual(out["live"], 2)
+            self.assertEqual(out["next"]["action"], "batch")
+            self.assertEqual({a["slug"] for a in out["next"]["round"]},
+                             {"기능-하나", "기능-둘"})
+
+    def test_run_all_does_not_resume_halted_without_resume(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._two(tmp)
+            sdd.cmd_abort(_ns(path=str(root), reason="테스트", spec="기능-둘", all=False))
+            out = _run(root, all=True)
+            self.assertEqual(out["live"], 1)
+            self.assertEqual(out["revived"], [])
+            self.assertEqual([a["slug"] for a in out["next"]["round"]], ["기능-하나"])
+
+    def test_run_all_resume_revives_halted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._two(tmp)
+            sdd.cmd_abort(_ns(path=str(root), reason="테스트", spec=None, all=True))
+            out = _run(root, all=True, resume=True)
+            self.assertEqual(sorted(out["revived"]), ["기능-둘", "기능-하나"])
+            self.assertEqual(out["live"], 2)
+
+    def test_run_all_with_nothing_live_explains(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._two(tmp)
+            sdd.cmd_abort(_ns(path=str(root), reason="테스트", spec=None, all=True))
+            out = _run(root, all=True)
+            self.assertFalse(out["ok"])
+            self.assertIn("--resume", out["reason"])
+
+    def test_run_feature_with_all_starts_then_batches(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._two(tmp)
+            out = _run(root, "기능 셋", all=True)
+            self.assertEqual(out["slug"], "기능-셋")
+            self.assertEqual(out["next"]["action"], "batch")
+            self.assertEqual(len(out["next"]["round"]), 3)
 
     def test_board_lists_every_pipeline(self):
         with tempfile.TemporaryDirectory() as tmp:

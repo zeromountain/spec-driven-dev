@@ -88,7 +88,8 @@ Keep the two manifests' `version` fields in lockstep — `scripts/validate.py` e
   pipelines advance together; and implement-stage pipelines serialize unless
   `impl-planner` gave disjoint `tasks[].files` — no plan means "unknown, assume overlap".
   `advance` refuses to guess a target when several pipelines are live, because feeding a
-  result to the wrong pipeline corrupts it silently. Keep `load_pipelines()`'s migration of
+  result to the wrong pipeline corrupts it silently. `run --all` is the batch entry point
+  (bare `run` resumes only `activePipeline`); `run --all --resume` also revives halted ones. Keep `load_pipelines()`'s migration of
   the pre-0.6.0 single `pipeline` field working whenever you touch the registry.
 - **Reviewers are called together, never in sequence.** The review stage emits
   `action: "call-agents"` (even when the roster holds one) and `advance` takes

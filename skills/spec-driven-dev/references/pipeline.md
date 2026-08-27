@@ -166,6 +166,7 @@ advance --result '{"reviews": [{"agent": "spec-reviewer", "verdict": "approved"}
 ```bash
 sdd.py run "기능 A"          # 막히지 않는다
 sdd.py run "기능 B"          # 둘 다 살아 있다
+sdd.py run --all             # 살아 있는 것 전부를 대상으로 배치 루프를 연다
 sdd.py board                 # 누가 지금 움직일 수 있는가
 sdd.py next --all            # 이번 라운드에 동시에 호출해도 되는 행동들
 sdd.py advance --spec 기능-a --result '<json>'
@@ -181,7 +182,7 @@ sdd.py advance --spec 기능-b --result '<json>'
 | `advance` | **거부한다.** 결과를 엉뚱한 파이프라인에 먹이면 그 기능의 상태가 남의 결과로 전이되고, 그건 조용히 잘못된다 |
 | `next` | `action: "choose-pipeline"` + 보드를 돌려준다 |
 | `abort` | 거부한다 (`--all`이 전부 중단) |
-| `run`(재개) | `activePipeline`을 쓴다 — 틀려도 파괴적이지 않다 |
+| `run`(재개) | `activePipeline` **하나만** 재개한다 — 전부를 돌리려면 `--all` |
 
 ### 스케줄러가 정하는 것
 
