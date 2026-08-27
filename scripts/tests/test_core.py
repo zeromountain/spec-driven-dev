@@ -1,4 +1,5 @@
 """sdd.py 핵심 로직 단위 테스트. 외부 의존성·네트워크 없음."""
+import shutil
 import sys
 import tempfile
 import unittest
@@ -437,7 +438,8 @@ def _ns(**kwargs):
 
 def _init_project(tmp: str) -> Path:
     root = Path(tmp)
-    sdd.cmd_init(_ns(path=str(root), enforce=False, specs=None, src=None, tests=None))
+    sdd.cmd_init(_ns(path=str(root), enforce=False, specs=None, src=None, tests=None,
+                     worktrees=False))
     return root
 
 
@@ -446,7 +448,7 @@ def _run(root: Path, feature=None, **kw):
                            resume=kw.get("resume", False), restart=kw.get("restart", False),
                            max_attempts=kw.get("max_attempts", sdd.DEFAULT_MAX_ATTEMPTS),
                            depth=kw.get("depth"), spec=kw.get("spec"),
-                           all=kw.get("all", False)))
+                           all=kw.get("all", False), worktree=kw.get("worktree")))
 
 
 def _next(root: Path, spec=None, all=False):
@@ -1071,7 +1073,8 @@ class ParallelPipelineTests(unittest.TestCase):
         """현재 페이즈에서 아무도 못 움직이면 게이트가 기다리는 쪽으로 넘어간다."""
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            sdd.cmd_init(_ns(path=str(root), enforce=True, specs=None, src=None, tests=None))
+            sdd.cmd_init(_ns(path=str(root), enforce=True, specs=None, src=None,
+                             tests=None, worktrees=False))
             _run(root, "기능 하나")
             spec_rel = _next(root)["context"]["specPath"]
             _write_valid_spec(root, spec_rel)
@@ -1084,7 +1087,8 @@ class ParallelPipelineTests(unittest.TestCase):
     def test_overlapping_implement_files_serialize(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            sdd.cmd_init(_ns(path=str(root), enforce=False, specs=None, src=None, tests=None))
+            sdd.cmd_init(_ns(path=str(root), enforce=False, specs=None, src=None,
+                             tests=None, worktrees=False))
             for name in ("기능 하나", "기능 둘"):
                 _run(root, name)
             state = sdd.load_state(root)
@@ -1103,7 +1107,8 @@ class ParallelPipelineTests(unittest.TestCase):
     def test_disjoint_implement_files_run_together(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            sdd.cmd_init(_ns(path=str(root), enforce=False, specs=None, src=None, tests=None))
+            sdd.cmd_init(_ns(path=str(root), enforce=False, specs=None, src=None,
+                             tests=None, worktrees=False))
             for name in ("기능 하나", "기능 둘"):
                 _run(root, name)
             state = sdd.load_state(root)
@@ -1121,7 +1126,8 @@ class ParallelPipelineTests(unittest.TestCase):
         """계획이 없으면 파일 범위를 모른다 — 추측으로 동시에 돌리지 않는다."""
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            sdd.cmd_init(_ns(path=str(root), enforce=False, specs=None, src=None, tests=None))
+            sdd.cmd_init(_ns(path=str(root), enforce=False, specs=None, src=None,
+                             tests=None, worktrees=False))
             for name in ("기능 하나", "기능 둘"):
                 _run(root, name)
             state = sdd.load_state(root)
@@ -1206,6 +1212,160 @@ class ParallelPipelineTests(unittest.TestCase):
             b = sdd.board(root)
             self.assertEqual(b["counts"], {"total": 2, "live": 2, "runnable": 2, "waiting": 0})
             self.assertTrue(all(r["scheduled"] == "runnable" for r in b["pipelines"]))
+
+
+def _git_project(tmp: str, enforce=False, worktrees=True) -> Path:
+    """커밋이 하나 있는 실제 git 저장소 위에 SDD 를 깐다."""
+    import subprocess
+    root = Path(tmp)
+    (root / "src").mkdir(exist_ok=True)
+    (root / "tests").mkdir(exist_ok=True)
+    (root / "README.md").write_text("# demo\n", encoding="utf-8")
+    # git 은 빈 디렉터리를 추적하지 않는다 — 파일이 있어야 워크트리에도 생긴다
+    (root / "src" / "app.py").write_text("x = 1\n", encoding="utf-8")
+    (root / "tests" / "__init__.py").write_text("", encoding="utf-8")
+    for args in (["init", "-q"], ["config", "user.email", "t@t"],
+                 ["config", "user.name", "t"], ["add", "-A"], ["commit", "-qm", "init"]):
+        subprocess.run(["git", "-C", str(root), *args], check=True, capture_output=True)
+    sdd.cmd_init(_ns(path=str(root), enforce=enforce, specs=None, src=None,
+                     tests=None, worktrees=worktrees))
+    return root
+
+
+@unittest.skipUnless(shutil.which("git"), "git 이 없다")
+class WorktreeTests(unittest.TestCase):
+    """기능마다 독립된 작업 디렉터리. 병렬 실행의 두 병목을 한 번에 없앤다."""
+
+    def test_run_creates_a_worktree_per_feature(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _git_project(tmp)
+            a = _run(root, "기능 하나")
+            b = _run(root, "기능 둘")
+            self.assertEqual(a["worktree"]["rel"], ".sdd/worktrees/기능-하나")
+            self.assertEqual(b["worktree"]["branch"], "sdd/기능-둘")
+            self.assertTrue((root / a["worktree"]["rel"] / "README.md").exists())
+            self.assertTrue((root / b["worktree"]["rel"] / "README.md").exists())
+
+    def test_worktrees_dir_is_gitignored(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _git_project(tmp)
+            _run(root, "기능 하나")
+            self.assertIn("worktrees/",
+                          (root / ".sdd" / ".gitignore").read_text(encoding="utf-8"))
+
+    def test_worktree_lifts_phase_coupling(self):
+        """enforce:true 여도 워크트리를 쓰면 페이즈가 달라도 함께 돈다."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _git_project(tmp, enforce=True)
+            _run(root, "기능 하나")
+            _run(root, "기능 둘")
+            _write_valid_spec(root, _next(root, spec="기능-하나")["context"]["specPath"])
+            _advance(root, {"openQuestions": []}, spec="기능-하나")
+            sched = sdd.schedule(root)
+            self.assertEqual(len(sched["runnable"]), 2)
+            self.assertEqual(sched["waiting"], [])
+
+    def test_worktree_lifts_file_overlap_serialization(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _git_project(tmp)
+            for name in ("기능 하나", "기능 둘"):
+                _run(root, name)
+            state = sdd.load_state(root)
+            pipes = sdd.load_pipelines(state)
+            for slug in pipes:
+                pipes[slug]["stage"] = "implement"
+                pipes[slug]["carry"]["plan"] = {"tasks": [{"files": ["src/shared.py"]}]}
+            sdd._store_pipelines(state, pipes)
+            sdd.write_json(root / ".sdd" / "state.json", state)
+            self.assertEqual(len(sdd.schedule(root)["runnable"]), 2)
+
+    def test_implement_context_points_at_the_worktree(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _git_project(tmp)
+            _run(root, "기능 하나")
+            _write_valid_spec(root, _next(root)["context"]["specPath"])
+            _advance(root, {"openQuestions": []})
+            ctx = _next(root)["context"]
+            self.assertTrue(ctx["workdir"].endswith(".sdd/worktrees/기능-하나"))
+            self.assertEqual(ctx["worktree"]["branch"], "sdd/기능-하나")
+            # 명세는 본체에 남는다 — 상태가 흩어지면 재개가 깨진다
+            self.assertTrue((root / ctx["specPath"]).exists())
+
+    def test_trace_scans_the_worktree_tests(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _git_project(tmp)
+            _run(root, "기능 하나")
+            _write_valid_spec(root, _next(root)["context"]["specPath"])
+            wt = root / ".sdd" / "worktrees" / "기능-하나" / "tests"
+            wt.mkdir(parents=True, exist_ok=True)
+            (wt / "test_a.py").write_text("# AC-1\ndef test_a(): pass\n", encoding="utf-8")
+            # 워크트리를 스캔하면 AC-1 이 잡힌다 (AC-2 는 태깅하지 않았다)
+            rep = sdd.build_review_report(root, "기능-하나", workdir=wt.parent)
+            self.assertEqual(rep["uncovered"], ["AC-2"])
+            self.assertEqual(rep["coverage"], 0.5)
+            # 본체를 스캔하면 아무것도 못 찾는다 — 실제로 워크트리를 본 것이다
+            main = sdd.build_review_report(root, "기능-하나", workdir=root)
+            self.assertEqual(main["coverage"], 0.0)
+
+    def test_hook_resolves_worktree_writes_per_pipeline(self):
+        """전역 phase 가 아니라 그 워크트리를 가진 파이프라인의 단계로 판정한다."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _git_project(tmp, enforce=True)
+            _run(root, "기능 하나")
+            _run(root, "기능 둘")
+            _write_valid_spec(root, _next(root, spec="기능-하나")["context"]["specPath"])
+            _advance(root, {"openQuestions": []}, spec="기능-하나")
+
+            state, config = sdd.load_state(root), sdd.load_config(root)
+            self.assertEqual(state["phase"], "implement")
+
+            phase, rel, owner = sdd.resolve_write(
+                str(root / ".sdd/worktrees/기능-둘/src/a.py"), root, state, config)
+            self.assertEqual((phase, rel, owner), ("spec", "src/a.py", "기능-둘"))
+            self.assertIsNotNone(sdd.evaluate_gate(phase, rel, config))
+
+            phase, rel, owner = sdd.resolve_write(
+                str(root / ".sdd/worktrees/기능-하나/src/a.py"), root, state, config)
+            self.assertEqual(owner, "기능-하나")
+            self.assertIsNone(sdd.evaluate_gate(phase, rel, config))
+
+    def test_worktree_remove_refuses_to_drop_uncommitted_work(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _git_project(tmp)
+            _run(root, "기능 하나")
+            (root / ".sdd/worktrees/기능-하나/src/new.py").write_text("x\n", encoding="utf-8")
+            out = sdd.cmd_worktree(_ns(path=str(root), action="remove",
+                                       spec="기능-하나", force=False))
+            self.assertFalse(out["ok"])
+            self.assertIn("커밋되지 않은 변경", out["reason"])
+            self.assertTrue((root / ".sdd/worktrees/기능-하나").exists())
+
+    def test_worktree_list_reports_dirty_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _git_project(tmp)
+            _run(root, "기능 하나")
+            (root / ".sdd/worktrees/기능-하나/src/new.py").write_text("x\n", encoding="utf-8")
+            out = sdd.cmd_worktree(_ns(path=str(root), action="list", spec=None, force=False))
+            self.assertTrue(out["enabled"])
+            self.assertTrue(out["worktrees"][0]["dirty"])
+
+    def test_no_worktree_flag_overrides_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _git_project(tmp)
+            out = _run(root, "기능 하나", worktree=False)
+            self.assertIsNone(out["worktree"])
+            self.assertFalse((root / ".sdd/worktrees/기능-하나").exists())
+
+    def test_non_git_project_falls_back_to_main_tree(self):
+        """git 이 아니어도 파이프라인은 돌아야 한다 — 다만 그 사실을 숨기지 않는다."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sdd.cmd_init(_ns(path=str(root), enforce=False, specs=None, src=None,
+                             tests=None, worktrees=True))
+            out = _run(root, "기능 하나")
+            self.assertTrue(out["ok"])
+            self.assertIsNone(out["worktree"])
+            self.assertIn("git 저장소가 아니다", out["worktreeWarning"])
 
 if __name__ == "__main__":
     unittest.main()

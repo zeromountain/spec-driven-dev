@@ -1,6 +1,6 @@
 {
   "name": "sdd",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "Spec-Driven Development execution harness: specs as the source of truth, three role-bound stages (Spec Architect / Software Engineer / Review Agent), a deterministic sdd.py CLI, and a traceability matrix between acceptance criteria and tests.",
   "author": {
     "name": "zeromountain",

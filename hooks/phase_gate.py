@@ -34,23 +34,25 @@ def main() -> int:
     if not state or not state.get("enforce"):
         return 0  # opt-in 안 됨 — 무동작
 
-    phase = state.get("phase", "off")
-    if not phase or phase == "off":
-        return 0
-
     tool_input = payload.get("tool_input", {}) or {}
     file_path = tool_input.get("file_path") or tool_input.get("notebook_path")
     if not file_path:
         return 0
 
-    rel = sdd.to_project_relative(file_path, project_root)
-    if rel is None:
-        return 0  # 프로젝트 밖 경로 — 이 게이트의 관심사가 아니다
-
     config = sdd.load_config(project_root)
+    # 워크트리 안의 경로면 그 워크트리를 가진 파이프라인의 단계로 판정한다 — 경로가
+    # 호출자를 알려주는 유일한 단서다.
+    phase, rel, owner = sdd.resolve_write(file_path, project_root, state, config)
+    if rel is None:
+        return 0  # 프로젝트 밖이거나 주인을 알 수 없는 경로 — 이 게이트의 관심사가 아니다
+    if not phase or phase == "off":
+        return 0
+
     reason = sdd.evaluate_gate(phase, rel, config)
     if reason is None:
         return 0
+    if owner:
+        reason = f"[{owner}] {reason}"
 
     print(json.dumps({
         "hookSpecificOutput": {

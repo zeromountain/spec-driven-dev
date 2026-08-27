@@ -41,6 +41,9 @@ DEFAULT_CONFIG = {
     "minCoverage": 0.9,
     "acPattern": r"AC-\d+",
     "alwaysWritable": ["AGENTS.md", "CLAUDE.md", ".sdd/**", "docs/**"],
+    "worktrees": False,
+    "worktreesDir": ".sdd/worktrees",
+    "worktreeBranchPrefix": "sdd/",
 }
 
 DEFAULT_STATE = {
@@ -666,6 +669,36 @@ def evaluate_gate(phase: str, rel_path: str, config: dict):
     return None
 
 
+def resolve_write(file_path: str, project_root: Path, state: dict, config: dict):
+    """쓰기 경로 하나를 (판정에 쓸 페이즈, 프로젝트 기준 상대경로, 소유 파이프라인)으로 푼다.
+
+    워크트리 안의 경로면 그 워크트리를 가진 파이프라인의 **자기 단계**로 판정한다.
+    훅의 stdin 에는 호출자 정보가 없지만 경로에는 슬러그가 들어 있으므로, 워크트리를
+    쓰는 동안에는 파이프라인별 게이팅이 가능해진다."""
+    wt_dir = config.get("worktreesDir", DEFAULT_CONFIG["worktreesDir"]).strip("/")
+    pipes = load_pipelines(state)
+
+    for slug, pipe in pipes.items():
+        wt = (pipe.get("worktree") or {}).get("rel")
+        if not wt:
+            continue
+        rel = to_project_relative(file_path, project_root / wt)
+        if rel is None:
+            continue
+        # 워크트리 안에서 다시 워크트리 디렉터리를 가리키면 남의 영역이다.
+        if _under(rel, wt_dir):
+            continue
+        return pipe.get("stage") or state.get("phase", "off"), rel, slug
+
+    rel = to_project_relative(file_path, project_root)
+    if rel is None:
+        return None, None, None
+    if _under(rel, wt_dir):
+        # 워크트리 디렉터리 안인데 주인을 못 찾았다 — 판정하지 않는다.
+        return None, None, None
+    return state.get("phase", "off"), rel, None
+
+
 def guard_violations(changed_files, phase: str, config: dict):
     violations = []
     for f in changed_files:
@@ -802,21 +835,31 @@ def cmd_init(args) -> dict:
             cfg["srcDirs"] = [s.strip() for s in args.src.split(",") if s.strip()]
         if args.tests:
             cfg["testDirs"] = [s.strip() for s in args.tests.split(",") if s.strip()]
+        if getattr(args, "worktrees", False):
+            cfg["worktrees"] = True
         write_json(config_path, cfg)
         created.append(str(config_path.relative_to(root)))
     else:
+        if getattr(args, "worktrees", False):
+            cfg = read_json(config_path) or {}
+            cfg["worktrees"] = True
+            write_json(config_path, cfg)
         skipped.append(str(config_path.relative_to(root)))
 
     gitignore_path = sdd_dir / ".gitignore"
     if not gitignore_path.exists():
-        gitignore_path.write_text("state.json\n", encoding="utf-8")
+        gitignore_path.write_text("state.json\nworktrees/\n", encoding="utf-8")
         created.append(str(gitignore_path.relative_to(root)))
     else:
         skipped.append(str(gitignore_path.relative_to(root)))
 
     agents_result = merge_agents_md(root)
+    cfg_now = load_config(root)
+    if cfg_now.get("worktrees"):
+        _ensure_worktrees_ignored(root, cfg_now)
 
-    return {"created": created, "skipped": skipped, "agentsMd": agents_result}
+    return {"created": created, "skipped": skipped, "agentsMd": agents_result,
+            "worktrees": bool(cfg_now.get("worktrees")), "gitRepo": git_ok(root)}
 
 
 def create_spec_file(root: Path, feature: str, slug=None) -> dict:
@@ -906,7 +949,7 @@ def cmd_tasks(args) -> dict:
     return ensure_tasks(root, resolve_slug(root, getattr(args, "slug", None)))
 
 
-def build_review_report(root: Path, slug, force=None) -> dict:
+def build_review_report(root: Path, slug, force=None, workdir=None) -> dict:
     """trace·depth 결과를 반영한 리뷰 리포트 골격을 .sdd/reviews/ 에 만든다."""
     config = load_config(root)
     specs_dir = root / config["specsDir"]
@@ -920,7 +963,9 @@ def build_review_report(root: Path, slug, force=None) -> dict:
     spec_path = specs_dir / slug / f"spec-v{version}.md"
     text = spec_path.read_text(encoding="utf-8")
     v = validate_spec(text, path=spec_path)
-    tr = trace_spec(text, config["testDirs"], config["acPattern"], root)
+    # 테스트는 이 파이프라인의 작업 디렉터리에 있다 (워크트리면 그쪽).
+    scan_root = Path(workdir) if workdir else root
+    tr = trace_spec(text, config["testDirs"], config["acPattern"], scan_root)
     covered = {m["ac"]: m for m in tr["matrix"]}
 
     ac_rows = "\n".join(
@@ -935,7 +980,8 @@ def build_review_report(root: Path, slug, force=None) -> dict:
     ec_table = "| EC | 처리됨 | 비고 |\n|---|---|---|\n" + ec_rows
 
     state = load_state(root)
-    violations = guard_violations(git_changed_files(root), state.get("phase", "off"), config)
+    violations = guard_violations(git_changed_files(scan_root),
+                                  state.get("phase", "off"), config)
     guard_rows = "\n".join(f"- `{x['file']}` — {x['reason'][:80]}" for x in violations) \
         or "- 없음"
 
@@ -1123,7 +1169,9 @@ def cmd_trace(args) -> dict:
     config = load_config(root)
     spec_path = Path(args.spec_path)
     text = spec_path.read_text(encoding="utf-8")
-    result = trace_spec(text, config["testDirs"], config["acPattern"], root)
+    scan_root = Path(args.workdir).resolve() if getattr(args, "workdir", None) else root
+    result = trace_spec(text, config["testDirs"], config["acPattern"], scan_root)
+    result["workdir"] = str(scan_root)
     result["spec"] = str(spec_path)
     return result
 
@@ -1133,9 +1181,11 @@ def cmd_guard(args) -> dict:
     config = load_config(root)
     state = load_state(root)
     phase = state.get("phase", "off")
-    changed = git_changed_files(root, args.base)
+    scan_root = Path(args.workdir).resolve() if getattr(args, "workdir", None) else root
+    changed = git_changed_files(scan_root, args.base)
     violations = guard_violations(changed, phase, config)
-    return {"phase": phase, "base": args.base, "violations": violations}
+    return {"phase": phase, "base": args.base, "workdir": str(scan_root),
+            "violations": violations}
 
 
 # ---------------------------------------------------------------------------
@@ -1225,6 +1275,7 @@ def _new_pipeline(feature: str, slug: str, max_attempts: int) -> dict:
         "stage": "spec",
         "status": "running",
         "agentIndex": 0,
+        "worktree": None,        # {rel, abs, branch, base} — 없으면 본체에서 작업한다
         "roster": None,          # 단계 진입 시 refresh_roster 가 채운다
         "depth": None,
         "forcedDepth": None,
@@ -1257,6 +1308,127 @@ def _new_pipeline(feature: str, slug: str, max_attempts: int) -> dict:
         "startedAt": now_iso(),
         "updatedAt": now_iso(),
     }
+
+
+# ---------------------------------------------------------------------------
+# 워크트리 — 기능마다 독립된 작업 디렉터리
+# ---------------------------------------------------------------------------
+#
+# 병렬 실행의 두 가지 병목을 한 번에 없앤다.
+#   1) 같은 파일을 동시에 고치는 문제 — 디렉터리가 아예 다르다.
+#   2) 페이즈 게이트가 프로젝트 전역이라 같은 페이즈끼리만 돌던 문제 — 워크트리 경로에
+#      슬러그가 들어 있으므로 훅이 "이 쓰기가 어느 파이프라인의 것인가"를 알 수 있고,
+#      그러면 파이프라인마다 자기 단계로 판정할 수 있다.
+#
+# 명세(`specs/`)와 제어면(`.sdd/`)은 **본체에만** 둔다. 명세는 슬러그별로 갈라져 있어
+# 애초에 충돌하지 않고, 상태가 여러 곳에 흩어지면 재개가 깨진다.
+
+
+def git_ok(root: Path) -> bool:
+    try:
+        out = subprocess.run(["git", "-C", str(root), "rev-parse", "--git-dir"],
+                             capture_output=True, text=True, check=False)
+        return out.returncode == 0
+    except (FileNotFoundError, OSError):
+        return False
+
+
+def _git(root: Path, *args) -> tuple:
+    """(성공여부, stdout, stderr). git 이 없으면 (False, "", 사유)."""
+    try:
+        out = subprocess.run(["git", "-C", str(root), *args],
+                             capture_output=True, text=True, check=False)
+    except (FileNotFoundError, OSError) as e:
+        return False, "", str(e)
+    return out.returncode == 0, out.stdout.strip(), out.stderr.strip()
+
+
+def worktree_paths(root: Path, config: dict, slug: str) -> dict:
+    wt_dir = config.get("worktreesDir", DEFAULT_CONFIG["worktreesDir"])
+    prefix = config.get("worktreeBranchPrefix", DEFAULT_CONFIG["worktreeBranchPrefix"])
+    rel = f"{wt_dir.strip('/')}/{slug}"
+    return {"rel": rel, "abs": str(root / rel), "branch": f"{prefix}{slug}"}
+
+
+def create_worktree(root: Path, slug: str, config=None) -> dict:
+    """`git worktree add`. 이미 있으면 그대로 재사용한다 (멱등)."""
+    config = config or load_config(root)
+    paths = worktree_paths(root, config, slug)
+    target = Path(paths["abs"])
+
+    if not git_ok(root):
+        return {"ok": False, "reason": "git 저장소가 아니다 — 워크트리를 만들 수 없다",
+                **paths}
+    if target.exists():
+        return {"ok": True, "created": False, "reason": "이미 있다", **paths}
+
+    base_ok, base, _ = _git(root, "rev-parse", "--abbrev-ref", "HEAD")
+    if not base_ok or not base:
+        return {"ok": False, "reason": "HEAD 를 읽을 수 없다 (커밋이 하나도 없는 저장소인가)",
+                **paths}
+
+    branch_exists = _git(root, "rev-parse", "--verify", "--quiet",
+                         f"refs/heads/{paths['branch']}")[0]
+    args = ["worktree", "add"]
+    args += [paths["rel"]] if branch_exists else ["-b", paths["branch"], paths["rel"], "HEAD"]
+    ok, _out, err = _git(root, *args)
+    if not ok:
+        return {"ok": False, "reason": f"git worktree add 실패: {err[:200]}", **paths}
+
+    _ensure_worktrees_ignored(root, config)
+    return {"ok": True, "created": True, "base": base, **paths}
+
+
+def _ensure_worktrees_ignored(root: Path, config: dict) -> None:
+    """워크트리 디렉터리가 본체의 추적 대상이 되면 안 된다."""
+    wt_dir = config.get("worktreesDir", DEFAULT_CONFIG["worktreesDir"]).strip("/")
+    if wt_dir.startswith(".sdd/"):
+        target, entry = root / ".sdd" / ".gitignore", wt_dir[len(".sdd/"):] + "/"
+    else:
+        target, entry = root / ".gitignore", wt_dir + "/"
+    lines = target.read_text(encoding="utf-8").splitlines() if target.exists() else []
+    if entry.rstrip("/") in [l.strip().rstrip("/") for l in lines]:
+        return
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("\n".join(lines + [entry]).strip() + "\n", encoding="utf-8")
+
+
+def remove_worktree(root: Path, slug: str, config=None, force: bool = False) -> dict:
+    config = config or load_config(root)
+    paths = worktree_paths(root, config, slug)
+    if not Path(paths["abs"]).exists():
+        return {"ok": True, "removed": False, "reason": "없다", **paths}
+    args = ["worktree", "remove", paths["rel"]] + (["--force"] if force else [])
+    ok, _out, err = _git(root, *args)
+    if not ok:
+        return {"ok": False, "reason": f"git worktree remove 실패: {err[:200]} "
+                                       "(커밋되지 않은 변경이 있으면 --force 가 필요하다)",
+                **paths}
+    return {"ok": True, "removed": True, **paths}
+
+
+def worktree_status(root: Path, slug: str, config=None) -> dict:
+    """이 워크트리에 커밋되지 않은 변경이 얼마나 있는가."""
+    config = config or load_config(root)
+    paths = worktree_paths(root, config, slug)
+    target = Path(paths["abs"])
+    if not target.exists():
+        return {"exists": False, **paths}
+    ok, out, _err = _git(target, "status", "--porcelain")
+    files = [l[3:].strip().strip('"') for l in out.splitlines() if len(l) > 3] if ok else []
+    ahead = _git(target, "rev-list", "--count", f"HEAD...{paths['branch']}")[1] if ok else ""
+    return {"exists": True, "dirty": bool(files), "changedFiles": files[:50],
+            "changedCount": len(files), "ahead": ahead, **paths}
+
+
+def pipeline_workdir(root: Path, pipe: dict) -> Path:
+    """이 파이프라인의 코드가 사는 디렉터리. 워크트리가 없으면 본체다."""
+    wt = (pipe or {}).get("worktree") or {}
+    if wt.get("rel"):
+        target = root / wt["rel"]
+        if target.exists():
+            return target
+    return root
 
 
 # ---------------------------------------------------------------------------
@@ -1395,6 +1567,8 @@ def pipeline_summary(pipe) -> dict:
         "agent": current_agent(pipe) if pipe.get("stage") in PIPELINE_STAGES else None,
         "roster": (pipe.get("roster") or {}).get(pipe.get("stage")),
         "depth": pipe.get("depth"),
+        "worktree": (pipe.get("worktree") or {}).get("rel"),
+        "branch": (pipe.get("worktree") or {}).get("branch"),
         "attempts": pipe.get("attempts"),
         "maxAttempts": pipe.get("maxAttempts"),
         "steps": pipe.get("steps"),
@@ -1467,32 +1641,43 @@ def schedule(root: Path) -> dict:
         # 오래 기다린 것부터 — 굶는 파이프라인이 생기지 않게 한다.
         return sorted(items, key=lambda p: (p.get("updatedAt") or "", p["slug"]))
 
+    def isolated(p):
+        """워크트리를 가진 파이프라인은 자기 디렉터리 안에서만 움직인다."""
+        return bool((p.get("worktree") or {}).get("rel"))
+
     waiting = []
     if enforce:
-        # 게이트가 프로젝트 전역이므로 같은 페이즈끼리만 함께 움직인다.
-        candidates = [p for p in ready if p.get("stage") == phase]
-        if not candidates:
-            # 현재 페이즈에서 움직일 수 있는 게 없다 → 가장 오래 기다린 쪽으로 페이즈를 넘긴다.
-            oldest = by_age(ready)
-            if oldest:
-                phase = oldest[0].get("stage")
-                candidates = [p for p in ready if p.get("stage") == phase]
+        # 게이트가 프로젝트 전역이므로 같은 페이즈끼리만 함께 움직인다 — 단, 워크트리를
+        # 가진 파이프라인은 예외다. 경로에 슬러그가 들어 있어 훅이 어느 파이프라인의
+        # 쓰기인지 알 수 있고, 그러면 자기 단계로 판정하므로 전역 페이즈에 매이지 않는다.
+        shared = [p for p in ready if not isolated(p)]
+        candidates = [p for p in ready if isolated(p) or p.get("stage") == phase]
+        if not any(p.get("stage") == phase for p in shared) and shared:
+            # 본체를 쓰는 것들 중 현재 페이즈에서 움직일 수 있는 게 없다 → 가장 오래
+            # 기다린 쪽으로 페이즈를 넘긴다 (굶지 않게).
+            phase = by_age(shared)[0].get("stage")
+            candidates = [p for p in ready if isolated(p) or p.get("stage") == phase]
         for p in ready:
             if p not in candidates:
                 waiting.append({"slug": p["slug"], "stage": p.get("stage"),
                                 "reason": f"페이즈 게이트가 지금 '{phase}' 를 잡고 있다 "
-                                          f"(enforce:true 에서는 같은 페이즈끼리만 동시에 돈다)"})
+                                          "(enforce:true 에서 본체를 공유하는 파이프라인은 "
+                                          "같은 페이즈끼리만 동시에 돈다 — 워크트리를 쓰면 "
+                                          "이 제약이 없다)"})
     else:
         candidates = list(ready)
 
-    # 구현 단계는 파일이 겹치면 동시에 돌릴 수 없다 — 페이즈와 무관한 제약이다.
+    # 구현 단계는 파일이 겹치면 동시에 돌릴 수 없다 — 워크트리를 쓰면 디렉터리가 아예
+    # 달라서 겹칠 수가 없으므로 이 검사도 건너뛴다.
     runnable = []
     for p in by_age(candidates):
-        if p.get("stage") == "implement":
-            conflicts = implement_conflicts(p, [q for q in runnable if q.get("stage") == "implement"])
+        if p.get("stage") == "implement" and not isolated(p):
+            conflicts = implement_conflicts(
+                p, [q for q in runnable if q.get("stage") == "implement" and not isolated(q)])
             if conflicts:
                 waiting.append({"slug": p["slug"], "stage": "implement",
-                                "reason": "구현 파일이 겹친다 — " + conflicts[0]["reason"],
+                                "reason": "구현 파일이 겹친다 — " + conflicts[0]["reason"]
+                                          + " (워크트리를 쓰면 이 제약이 없다)",
                                 "blockedBy": [c["slug"] for c in conflicts]})
                 continue
         runnable.append(p)
@@ -1526,6 +1711,7 @@ def board(root: Path) -> dict:
             row["scheduled"] = pipe.get("status")
         rows.append(row)
     return {"phase": sched["phase"], "enforce": sched["enforce"],
+            "worktrees": bool(load_config(root).get("worktrees")),
             "activePipeline": state.get("activePipeline"),
             "counts": {"total": len(pipes), "live": sched["live"],
                        "runnable": len(sched["runnable"]),
@@ -1710,6 +1896,7 @@ def _next_spec(root: Path, pipe: dict) -> dict:
         "reviewGaps": carry.get("reviewGaps") or [],
         "userAnswers": carry.get("userAnswers") or {},
         "acPattern": config["acPattern"],
+        "workdir": str(pipeline_workdir(root, pipe)),
         "contextPack": carry.get("contextPack"),
         "auditFindings": carry.get("auditFindings"),
     }
@@ -1765,6 +1952,8 @@ def _next_implement(root: Path, pipe: dict) -> dict:
         "srcDirs": config["srcDirs"],
         "testDirs": config["testDirs"],
         "acPattern": config["acPattern"],
+        "workdir": str(pipeline_workdir(root, pipe)),
+        "worktree": pipe.get("worktree"),
         "previousTestFailures": carry.get("testFailures"),
         "reviewGaps": carry.get("reviewGaps") or [],
         "lastReviewPath": pipe.get("lastReviewPath"),
@@ -1811,7 +2000,8 @@ def _next_review(root: Path, pipe: dict) -> dict:
     refresh_roster(root, pipe)
 
     if not pipe.get("reviewPath"):
-        rep = build_review_report(root, pipe["slug"], force=pipe.get("forcedDepth"))
+        rep = build_review_report(root, pipe["slug"], force=pipe.get("forcedDepth"),
+                                  workdir=pipeline_workdir(root, pipe))
         if not rep.get("created"):
             _halt(pipe, "리뷰 리포트를 만들지 못했다: " + str(rep.get("reason")))
             _persist_pipeline(root, pipe)
@@ -1834,6 +2024,7 @@ def _next_review(root: Path, pipe: dict) -> dict:
         "uncovered": meta.get("uncovered"),
         "guardViolations": meta.get("guardViolations"),
         "minCoverage": meta.get("minCoverage", config.get("minCoverage")),
+        "workdir": str(pipeline_workdir(root, pipe)),
         "implementNotes": carry.get("implementNotes"),
         "testResult": carry.get("testResult"),
         "previousGaps": carry.get("reviewGaps") or [],
@@ -2220,15 +2411,35 @@ def cmd_run(args) -> dict:
 
     pipe = _new_pipeline(feature, slug, args.max_attempts)
     pipe["forcedDepth"] = getattr(args, "depth", None)
+
+    config = load_config(root)
+    want_wt = getattr(args, "worktree", None)
+    if want_wt is None:
+        want_wt = bool(config.get("worktrees"))
+    wt_note = None
+    if want_wt:
+        wt = create_worktree(root, slug, config)
+        if wt.get("ok"):
+            pipe["worktree"] = {k: wt[k] for k in ("rel", "abs", "branch") if k in wt}
+            pipe["worktree"]["base"] = wt.get("base")
+            _record(pipe, "worktree-created", path=wt["rel"], branch=wt["branch"])
+        else:
+            # 워크트리를 못 만들었다고 파이프라인을 막지 않는다 — 본체에서 돌되 그 사실을
+            # 숨기지 않는다. 병렬 실행은 스케줄러가 직렬화로 안전하게 처리한다.
+            wt_note = f"워크트리를 만들지 못해 본체에서 작업한다: {wt.get('reason')}"
+            _record(pipe, "worktree-failed", reason=wt.get("reason"))
     d = refresh_roster(root, pipe)
     _record(pipe, "started", feature=feature, slug=slug, depth=d["depth"])
     _persist_pipeline(root, pipe)
     result = {"ok": True, "started": True, "slug": slug,
+              "worktree": pipe.get("worktree"),
               "pipeline": pipeline_summary(pipe),
               "depth": {"depth": d["depth"], "forcedTo": d["forcedTo"],
                         "deepReasons": d["deepReasons"], "agents": d["agents"],
                         "agentCount": sum(len(v) for v in d["agents"].values())},
               "next": compute_next(root, slug)}
+    if wt_note:
+        result["worktreeWarning"] = wt_note
     brd = board(root)
     if all_mode:
         result["all"] = True
@@ -2247,6 +2458,57 @@ def cmd_next(args) -> dict:
     if getattr(args, "all", False):
         return compute_next_all(root)
     return compute_next(root, getattr(args, "spec", None))
+
+
+def cmd_worktree(args) -> dict:
+    """워크트리 조회·생성·정리. 병합은 하지 않는다 — 사용자의 판단이다."""
+    root = Path(args.path).resolve()
+    config = load_config(root)
+    state = load_state(root)
+    pipes = load_pipelines(state)
+    action = args.action
+
+    if action == "list":
+        rows = []
+        for slug, pipe in sorted(pipes.items()):
+            if not (pipe.get("worktree") or {}).get("rel"):
+                continue
+            row = worktree_status(root, slug, config)
+            row.update({"slug": slug, "stage": pipe.get("stage"),
+                        "status": pipe.get("status")})
+            rows.append(row)
+        return {"ok": True, "enabled": bool(config.get("worktrees")),
+                "gitRepo": git_ok(root), "worktrees": rows}
+
+    slug = getattr(args, "spec", None) or resolve_pipeline_slug(state, allow_active=True)
+    if not slug:
+        return {"ok": False, "reason": "대상 파이프라인이 없다 — `--spec <슬러그>` 로 지정하라"}
+
+    if action == "add":
+        wt = create_worktree(root, slug, config)
+        if wt.get("ok") and slug in pipes:
+            pipes[slug]["worktree"] = {k: wt[k] for k in ("rel", "abs", "branch") if k in wt}
+            pipes[slug]["worktree"]["base"] = wt.get("base")
+            _persist_pipeline(root, pipes[slug], focus=False)
+        return {"ok": wt.get("ok", False), "slug": slug, **wt}
+
+    if action == "remove":
+        st = worktree_status(root, slug, config)
+        if st.get("dirty") and not args.force:
+            return {"ok": False, "slug": slug, "reason":
+                    f"커밋되지 않은 변경이 {st['changedCount']}개 있다 — 확인하고 나서 "
+                    "`--force` 를 주거나 워크트리에서 직접 커밋하라",
+                    "changedFiles": st["changedFiles"][:10], **st}
+        out = remove_worktree(root, slug, config, force=bool(args.force))
+        if out.get("ok") and slug in pipes:
+            pipes[slug]["worktree"] = None
+            _persist_pipeline(root, pipes[slug], focus=False)
+        return {"ok": out.get("ok", False), "slug": slug, **out}
+
+    if action == "status":
+        return {"ok": True, "slug": slug, **worktree_status(root, slug, config)}
+
+    return {"ok": False, "reason": f"알 수 없는 동작: {action}"}
 
 
 def cmd_board(args) -> dict:
@@ -2374,6 +2636,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--specs", default=None, help="specs 디렉터리 이름 (기본: specs)")
     sp.add_argument("--src", default=None, help="쉼표로 구분된 소스 디렉터리 목록")
     sp.add_argument("--tests", default=None, help="쉼표로 구분된 테스트 디렉터리 목록")
+    sp.add_argument("--worktrees", action="store_true",
+                    help="기능마다 git 워크트리를 만들어 격리 작업한다")
     sp.set_defaults(func=cmd_init)
 
     sp = sub.add_parser("new", help="새 기능 명세 생성")
@@ -2429,11 +2693,15 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("trace", help="인수기준 ↔ 테스트 추적성 행렬")
     add_path(sp)
     sp.add_argument("spec_path", help="대상 spec-vN.md 경로")
+    sp.add_argument("--workdir", default=None,
+                    help="테스트를 찾을 디렉터리 (워크트리 경로; 기본: 프로젝트 루트)")
     sp.set_defaults(func=cmd_trace)
 
     sp = sub.add_parser("guard", help="페이즈 위반 사후 탐지 (git diff 기준)")
     add_path(sp)
     sp.add_argument("--base", default="HEAD", help="비교 기준 (기본: HEAD)")
+    sp.add_argument("--workdir", default=None,
+                    help="변경을 볼 디렉터리 (워크트리 경로; 기본: 프로젝트 루트)")
     sp.set_defaults(func=cmd_guard)
 
     sp = sub.add_parser("run", help="파이프라인 시작 또는 재개 (spec→implement→review)")
@@ -2452,6 +2720,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--all", action="store_true",
                     help="살아 있는 파이프라인 전부를 대상으로 배치 루프를 연다 "
                          "(--resume 과 함께 주면 halted 인 것도 되살린다)")
+    wt = sp.add_mutually_exclusive_group()
+    wt.add_argument("--worktree", dest="worktree", action="store_true", default=None,
+                    help="이 기능만 워크트리에서 작업한다 (config 설정을 덮어쓴다)")
+    wt.add_argument("--no-worktree", dest="worktree", action="store_false",
+                    help="config 가 켜져 있어도 본체에서 작업한다")
     sp.set_defaults(func=cmd_run)
 
     sp = sub.add_parser("next", help="다음 행동을 지시한다 (--all 이면 동시 실행 가능한 전부)")
@@ -2464,6 +2737,14 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("board", help="모든 파이프라인의 위치·실행 가능 여부를 한 장으로")
     add_path(sp)
     sp.set_defaults(func=cmd_board)
+
+    sp = sub.add_parser("worktree", help="기능별 워크트리 조회·생성·정리 (병합은 하지 않는다)")
+    add_path(sp)
+    sp.add_argument("action", choices=["list", "add", "remove", "status"])
+    sp.add_argument("--spec", default=None, help="대상 파이프라인 슬러그")
+    sp.add_argument("--force", action="store_true",
+                    help="커밋되지 않은 변경이 있어도 제거한다 (변경이 사라진다)")
+    sp.set_defaults(func=cmd_worktree)
 
     sp = sub.add_parser("advance", help="서브에이전트 결과를 넘겨 다음 단계로 전이한다")
     add_path(sp)

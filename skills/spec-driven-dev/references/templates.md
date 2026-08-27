@@ -33,9 +33,11 @@
 │       ├── spec-v<N>.md
 │       └── tasks.md
 └── .sdd/
-    ├── state.json      # 세션 로컬 (gitignore)
+    ├── state.json      # 세션 로컬 (gitignore) — pipelines 레지스트리가 여기 산다
     ├── config.json     # 팀 공유 (커밋)
-    ├── .gitignore
-    └── reviews/
-        └── <slug>-v<N>-<seq>.md
+    ├── .gitignore      # state.json, worktrees/
+    ├── reviews/
+    │   └── <slug>-v<N>-<seq>.md
+    └── worktrees/      # worktrees:true 일 때만 (gitignore)
+        └── <slug>/     # 기능별 체크아웃, 브랜치 sdd/<slug>
 ```
