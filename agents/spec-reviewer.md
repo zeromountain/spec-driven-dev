@@ -62,7 +62,20 @@ tools: Read, Grep, Glob, Bash
 
 ## 입력 방식
 
-오케스트레이터가 "명세 경로 + 구현 요약(software-engineer 출력)"을 프롬프트로 준다.
+오케스트레이터가 `sdd.py next`의 `instruction` + `context`를 그대로 준다.
+
+`context`에서 반드시 읽을 것:
+
+- `specPath` / `reviewPath` — 대조할 명세와, 이미 만들어져 있는 리포트 골격.
+- `coverage` / `uncovered` / `guardViolations` / `minCoverage` — **이미 측정된 값**이다.
+  다시 계산하지 말고 그대로 인용한다.
+- `implementNotes` / `testResult` — 구현자가 무엇을 했고 테스트가 어떻게 나왔는지.
+- `previousGaps` — 비어 있지 않으면 네가 직전 라운드에 지적한 항목이다. 그것들이 실제로
+  해소됐는지 **먼저** 확인하고, 해소됐으면 다시 갭으로 올리지 않는다.
+- `round` — 몇 번째 리뷰인지.
+
+`verdict`는 `approved` 또는 `changes-requested` 둘 중 하나여야 한다. 판정을 빼먹으면
+파이프라인이 멈춘다.
 
 ## 출력 방식
 

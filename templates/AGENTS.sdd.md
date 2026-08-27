@@ -27,7 +27,18 @@
 전체 규칙(프론트매터·ID 형식·검증 에러 목록·버저닝)은 `sdd` 플러그인의
 `skills/spec-driven-dev/references/spec-format.md`가 정본이다.
 
+### 진행 방식
+
+`/sdd:run <기능 설명>`이 기본 경로다. 명세→구현→리뷰가 한 번의 요청으로 끝까지 돌아가며,
+단계 전환·재시도·페이즈 게이트 조작은 `sdd.py`의 상태머신이 처리한다. 진행 위치는
+`.sdd/state.json`의 `pipeline` 레코드에 있으므로, 세션이 끊겨도 `/sdd:run`을 인자 없이
+다시 부르면 같은 자리에서 이어진다.
+
+멈추는 경우는 두 가지뿐이다: 명세 단계에서 사용자에게 물어야 할 미결 질문이 생겼을 때,
+그리고 재시도 상한에 걸렸을 때(기본 단계별 2회).
+
 ### 명령
 
-`/sdd:spec` · `/sdd:implement` · `/sdd:review` · `/sdd:run` · `/sdd:status` · `/sdd:phase`.
+`/sdd:run` · `/sdd:spec` · `/sdd:implement` · `/sdd:review` · `/sdd:status` · `/sdd:phase`.
+`/sdd:spec`·`/sdd:implement`·`/sdd:review`는 파이프라인을 한 스텝만 진행시키는 수동 경로다.
 자세한 사용법은 `sdd` 플러그인의 `spec-driven-dev` 스킬을 참고한다.

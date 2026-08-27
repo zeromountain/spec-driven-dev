@@ -59,7 +59,19 @@ tools: Read, Write, Edit, Grep, Glob, Bash
 
 ## 입력 방식
 
-오케스트레이터가 "명세 경로 + 대상 프로젝트의 언어/테스트 러너 정보"를 프롬프트로 준다.
+오케스트레이터가 `sdd.py next`의 `instruction` + `context`를 그대로 준다.
+
+`context`에서 반드시 읽을 것:
+
+- `specPath` / `tasksPath` / `acIds` — 구현 대상과 AC 대응표.
+- `srcDirs` / `testDirs` / `acPattern` — 쓸 수 있는 경로와 테스트에 붙일 AC 태그 형식.
+- `previousTestFailures` — 비어 있지 않으면 **직전 시도가 실패했다는 뜻**이다. 같은 시도를
+  반복하지 말고 가설을 바꿔서 접근한다.
+- `reviewGaps` — 비어 있지 않으면 리뷰가 `changes-requested`를 낸 것이다. 항목을 하나도
+  남기지 말고 고친다. `lastReviewPath`에 리포트 전문이 있으니 Read로 읽는다.
+
+명세를 바꿔야만 구현할 수 있으면 임의로 구현하지 말고 `specChangeRequests`에 담아 반환한다 —
+파이프라인이 명세 단계로 되돌려 새 버전을 만든다.
 
 ## 출력 방식
 

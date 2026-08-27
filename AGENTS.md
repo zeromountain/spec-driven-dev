@@ -55,6 +55,16 @@ Keep the two manifests' `version` fields in lockstep — `scripts/validate.py` e
 - **A Claude Code subagent cannot spawn another subagent.** `/sdd:run`'s spec → implement →
   review orchestration therefore lives in `SKILL.md` (loaded into the main session), not in an
   agent.
+- **The orchestrator decides nothing about sequencing.** Where a run is and what comes next
+  live in `.sdd/state.json`'s `pipeline` record, driven by `sdd.py run` / `next` / `advance`
+  (see `skills/spec-driven-dev/references/pipeline.md`). `next` also performs the deterministic
+  side effects of entering a stage — phase transition, spec file creation, `tasks.md`, review
+  report skeleton — so the skill never calls `phase`/`new`/`tasks`/`review-report` by hand
+  during a run. `next` is idempotent per stage; `advance` is not (exactly one call per
+  subagent result, and `--stage` guards against a mismatched one).
+- **Everything that crosses a subagent boundary goes through `pipeline.carry`.** Subagents
+  can't see each other's context, so review gaps, test failures, validate errors, and user
+  answers are carried in state and re-injected by `next` — never re-summarized by the LLM.
 - Scaffolded artifacts (`AGENTS.md` section, spec/tasks/review templates, command and skill
   descriptions) are written in Korean for the target audience; this repo's own `AGENTS.md` is
   English.

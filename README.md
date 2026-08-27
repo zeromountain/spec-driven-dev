@@ -40,16 +40,34 @@ codex --plugin-dir ~/spec-driven-dev              # Codex CLI
 **Claude Code** — 슬래시 커맨드 7개:
 ```
 /sdd:init                                  # specs/·AGENTS.md·.sdd/ 스캐폴딩
-/sdd:spec 사용자 엔티티에 결혼여부 필드 추가    # 명세 작성 (Spec Architect)
-/sdd:implement                             # 구현 + 테스트 (Software Engineer)
-/sdd:review                                # 명세 대조 리뷰 (Review Agent)
-/sdd:run 사용자 엔티티에 결혼여부 필드 추가    # 위 세 단계를 순서대로
-/sdd:status                                # 현재 페이즈·명세 목록·게이트 위반
+/sdd:run 사용자 엔티티에 결혼여부 필드 추가    # 명세→구현→리뷰를 끝까지 자동으로
+/sdd:run                                   # 중단된 파이프라인을 그 자리에서 재개
+/sdd:spec / implement / review              # 파이프라인을 한 스텝만 (수동)
+/sdd:status                                # 페이즈·파이프라인 위치·명세·게이트 위반
 /sdd:phase off                             # 페이즈 게이트 해제
 ```
 
 `/sdd:init` 실행 시 하드 페이즈 게이트(파일 쓰기를 실제로 차단하는 훅)를 켤지 물어본다.
 꺼둔 채로도 세 역할 분리와 명세 규약은 그대로 적용된다 — 다만 강제는 프롬프트 수준이다.
+
+### 파이프라인
+
+`/sdd:run`은 대화가 아니라 `sdd.py`의 상태머신을 따라 돈다. `next`가 다음 행동 하나를
+지시하고, 서브에이전트 결과를 `advance`가 받아 전이를 결정한다 — 페이즈 전환, 명세 파일
+생성, `tasks.md`, 리뷰 리포트 골격, 재시도 카운트, 승인 시 `status: done` 기록까지 전부
+스크립트 몫이라 오케스트레이터가 단계 사이에서 판단하지 않는다.
+
+```
+spec ──validate 통과──▶ implement ──테스트 통과──▶ review ──approved──▶ done
+ ▲                          │                        │
+ └──specChangeRequests──────┘      changes-requested └──▶ implement (gaps 인계)
+```
+
+진행 위치는 `.sdd/state.json`의 `pipeline` 레코드 하나에만 있으므로 세션이 끊기거나
+컨텍스트가 날아가도 `/sdd:run`을 인자 없이 다시 부르면 같은 자리에서 이어진다. 멈추는
+경우는 미결 질문(`ask-user`)과 재시도 상한 초과(`halted`) 둘뿐이고, 단계별 상한은 기본
+2회, 전체 전이 상한은 24회다. 전이표·인계 항목·중단 사유는
+[`references/pipeline.md`](skills/spec-driven-dev/references/pipeline.md)에 있다.
 
 **Codex CLI** — 슬래시 커맨드 대신 스킬을 직접 부른다:
 ```

@@ -53,6 +53,13 @@ PreToolUse 훅의 stdin 페이로드에는 `session_id`, `cwd`, `tool_name`, `to
 `evaluate_gate`로 검사한다 — 실시간 차단은 아니지만, 리뷰 단계에서 위반이 있었는지는
 반드시 드러난다.
 
+## 파이프라인이 도는 동안
+
+페이즈 전환은 `sdd.py next`가 각 단계에 진입할 때 자동으로 한다(`/sdd:phase`와 같은
+`transition_phase` 함수다). 파이프라인이 돌고 있으면 페이즈를 손으로 바꾸지 마라 —
+상태가 어긋난다. `implement` 전환이 `blocked`면 파이프라인은 게이트를 끄는 대신 그 이유를
+담아 `halted`가 된다. 자세한 것은 `pipeline.md`를 본다.
+
 ## 탈출구
 
 - `/sdd:phase off` — 게이트가 걸리는 페이즈를 벗어난다.

@@ -16,7 +16,8 @@ createdAt: <ISO8601>
 
 `feature`/`version`/`status`가 없으면 에러. `validate`에 파일 경로가 주어지면
 `version`↔파일명, `feature`↔디렉터리를 교차 검증한다 — 복사·붙여넣기로 버전이 어긋난
-명세를 잡아낸다. `status`는 리뷰 승인 시 오케스트레이터가 `done`으로 올린다.
+명세를 잡아낸다. `status`는 리뷰가 `approved`를 낼 때 `sdd.py advance`가 `done`으로 올린다
+(오케스트레이터가 손으로 고치지 않는다 — `pipeline.md`의 "페이즈 게이트와의 관계" 참조).
 
 ## 8개 섹션
 

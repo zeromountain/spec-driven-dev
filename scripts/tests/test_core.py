@@ -435,5 +435,293 @@ def _ns(**kwargs):
     return ns
 
 
+def _init_project(tmp: str) -> Path:
+    root = Path(tmp)
+    sdd.cmd_init(_ns(path=str(root), enforce=False, specs=None, src=None, tests=None))
+    return root
+
+
+def _run(root: Path, feature=None, **kw):
+    return sdd.cmd_run(_ns(path=str(root), feature=feature, slug=kw.get("slug"),
+                           resume=kw.get("resume", False), restart=kw.get("restart", False),
+                           max_attempts=kw.get("max_attempts", sdd.DEFAULT_MAX_ATTEMPTS)))
+
+
+def _next(root: Path):
+    return sdd.cmd_next(_ns(path=str(root)))
+
+
+def _advance(root: Path, result: dict, stage=None):
+    import json as _json
+    return sdd.cmd_advance(_ns(path=str(root), result=_json.dumps(result), stage=stage))
+
+
+def _write_valid_spec(root: Path, rel_path: str, version: int = 1):
+    """파이프라인이 만든 빈 명세 자리에 유효한 명세를 써넣는다 (아키텍트 역할 대역)."""
+    text = VALID_SPEC
+    if version != 1:
+        text = text.replace("version: 1", f"version: {version}")
+    (root / rel_path).write_text(text, encoding="utf-8")
+
+
+class PipelineTests(unittest.TestCase):
+    """run → next → advance 상태머신. 흐름의 연속성이 상태 파일에만 의존하는지 본다."""
+
+    def test_run_starts_and_next_calls_architect(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(tmp)
+            started = _run(root, "테스트 기능")
+            self.assertTrue(started["ok"])
+            nxt = started["next"]
+            self.assertEqual(nxt["action"], "call-agent")
+            self.assertEqual(nxt["agent"], "spec-architect")
+            self.assertEqual(nxt["stage"], "spec")
+            spec_rel = nxt["context"]["specPath"]
+            self.assertTrue((root / spec_rel).exists())
+            self.assertEqual(sdd.load_state(root)["phase"], "spec")
+
+    def test_next_is_idempotent(self):
+        """next를 두 번 불러도 명세 파일이 두 개 생기지 않는다."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(tmp)
+            _run(root, "테스트 기능")
+            first = _next(root)["context"]["specPath"]
+            second = _next(root)["context"]["specPath"]
+            self.assertEqual(first, second)
+            self.assertEqual(len(list((root / "specs" / "테스트-기능").glob("spec-v*.md"))), 1)
+
+    def test_happy_path_to_approved(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(tmp)
+            spec_rel = _run(root, "테스트 기능")["next"]["context"]["specPath"]
+            _write_valid_spec(root, spec_rel)
+
+            after_spec = _advance(root, {"notes": "명세 완성"})
+            self.assertEqual(after_spec["next"]["stage"], "implement")
+            self.assertEqual(after_spec["next"]["agent"], "software-engineer")
+            self.assertEqual(sdd.load_state(root)["phase"], "implement")
+            self.assertTrue((root / "specs" / "테스트-기능" / "tasks.md").exists())
+
+            after_impl = _advance(root, {"testResult": {"passed": 2, "failed": 0}})
+            self.assertEqual(after_impl["next"]["stage"], "review")
+            self.assertEqual(after_impl["next"]["agent"], "spec-reviewer")
+
+            after_review = _advance(root, {"verdict": "approved"})
+            self.assertEqual(after_review["next"]["action"], "done")
+            self.assertEqual(after_review["pipeline"]["status"], "done")
+            fm, _ = sdd.parse_frontmatter((root / spec_rel).read_text(encoding="utf-8"))
+            self.assertEqual(fm["status"], "done")
+            self.assertEqual(sdd.load_state(root)["phase"], "off")
+
+    def test_invalid_spec_retries_then_halts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(tmp)
+            _run(root, "테스트 기능", max_attempts=2)
+            first = _advance(root, {})            # 플레이스홀더 그대로 → 검증 실패
+            self.assertEqual(first["next"]["stage"], "spec")
+            self.assertTrue(first["next"]["context"]["validateErrors"])
+            _advance(root, {})
+            third = _advance(root, {})
+            self.assertEqual(third["next"]["action"], "halted")
+            self.assertIn("명세 검증", third["pipeline"]["haltReason"])
+
+    def test_review_gaps_reach_the_engineer(self):
+        """리뷰 지적이 구현 단계 컨텍스트로 그대로 넘어간다."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(tmp)
+            spec_rel = _run(root, "테스트 기능")["next"]["context"]["specPath"]
+            _write_valid_spec(root, spec_rel)
+            _advance(root, {})
+            _advance(root, {"testResult": {"passed": 1, "failed": 0}, "notes": "구현함"})
+            back = _advance(root, {"verdict": "changes-requested",
+                                   "gaps": ["AC-2 테스트가 없다"]})
+            self.assertEqual(back["next"]["stage"], "implement")
+            self.assertEqual(back["next"]["context"]["reviewGaps"], ["AC-2 테스트가 없다"])
+            self.assertIsNotNone(back["next"]["context"]["lastReviewPath"])
+
+    def test_review_loop_halts_after_max_attempts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(tmp)
+            spec_rel = _run(root, "테스트 기능", max_attempts=1)["next"]["context"]["specPath"]
+            _write_valid_spec(root, spec_rel)
+            _advance(root, {})
+            for _ in range(2):
+                _advance(root, {"testResult": {"passed": 1, "failed": 0}})
+                last = _advance(root, {"verdict": "changes-requested", "gaps": ["여전히 갭"]})
+            self.assertEqual(last["next"]["action"], "halted")
+            self.assertIn("changes-requested", last["pipeline"]["haltReason"])
+
+    def test_failing_tests_carry_forward_then_halt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(tmp)
+            spec_rel = _run(root, "테스트 기능", max_attempts=1)["next"]["context"]["specPath"]
+            _write_valid_spec(root, spec_rel)
+            _advance(root, {})
+            retry = _advance(root, {"testResult": {"failed": 3, "output": "boom"}})
+            self.assertEqual(retry["next"]["stage"], "implement")
+            self.assertEqual(retry["next"]["context"]["previousTestFailures"]["failed"], 3)
+            halted = _advance(root, {"testResult": {"failed": 1}})
+            self.assertEqual(halted["next"]["action"], "halted")
+
+    def test_spec_change_request_creates_new_version(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(tmp)
+            spec_rel = _run(root, "테스트 기능")["next"]["context"]["specPath"]
+            _write_valid_spec(root, spec_rel)
+            _advance(root, {})
+            back = _advance(root, {"specChangeRequests": ["AC-3이 빠졌다"]})
+            self.assertEqual(back["next"]["stage"], "spec")
+            ctx = back["next"]["context"]
+            self.assertTrue(ctx["specPath"].endswith("spec-v2.md"))
+            self.assertEqual(ctx["previousSpecPath"], spec_rel)
+            self.assertEqual(ctx["specChangeRequests"], ["AC-3이 빠졌다"])
+
+    def test_tasks_refresh_on_new_spec_version(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(tmp)
+            spec_rel = _run(root, "테스트 기능")["next"]["context"]["specPath"]
+            _write_valid_spec(root, spec_rel)
+            _advance(root, {})
+            tasks = root / "specs" / "테스트-기능" / "tasks.md"
+            self.assertIn("spec-v1 기준", tasks.read_text(encoding="utf-8"))
+            _advance(root, {"specChangeRequests": ["범위 변경"]})
+            _write_valid_spec(root, _next(root)["context"]["specPath"], version=2)
+            _advance(root, {})
+            self.assertIn("spec-v2 기준", tasks.read_text(encoding="utf-8"))
+
+    def test_open_questions_pause_and_resume(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(tmp)
+            spec_rel = _run(root, "테스트 기능")["next"]["context"]["specPath"]
+            paused = _advance(root, {"openQuestions": ["결혼여부는 필수인가?"]})
+            self.assertEqual(paused["next"]["action"], "ask-user")
+            self.assertEqual(paused["next"]["questions"], ["결혼여부는 필수인가?"])
+            _write_valid_spec(root, spec_rel)
+            answered = _advance(root, {"answers": {"결혼여부는 필수인가?": "선택 입력"}})
+            self.assertEqual(answered["next"]["stage"], "spec")
+            self.assertEqual(
+                answered["next"]["context"]["userAnswers"], {"결혼여부는 필수인가?": "선택 입력"})
+
+    def test_resume_reads_position_from_state_only(self):
+        """대화 컨텍스트가 사라져도 state.json만으로 같은 자리에서 재개된다."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(tmp)
+            spec_rel = _run(root, "테스트 기능")["next"]["context"]["specPath"]
+            _write_valid_spec(root, spec_rel)
+            _advance(root, {})
+            resumed = _run(root)                      # 인자 없는 재개
+            self.assertTrue(resumed["resumed"])
+            self.assertEqual(resumed["next"]["stage"], "implement")
+            self.assertEqual(resumed["next"]["context"]["specPath"], spec_rel)
+
+    def test_resume_revives_a_halted_pipeline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(tmp)
+            _run(root, "테스트 기능")
+            sdd.cmd_abort(_ns(path=str(root), reason="잠깐 멈춤"))
+            self.assertEqual(_next(root)["action"], "halted")
+            revived = _run(root, resume=True)
+            self.assertEqual(revived["next"]["action"], "call-agent")
+            self.assertEqual(revived["pipeline"]["status"], "running")
+
+    def test_revive_resets_the_retry_budget(self):
+        """상한에 걸려 멈춘 파이프라인을 되살리면 재시도 예산이 돌아온다."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(tmp)
+            _run(root, "테스트 기능", max_attempts=1)
+            _advance(root, {})
+            halted = _advance(root, {})
+            self.assertEqual(halted["next"]["action"], "halted")
+            revived = _run(root, resume=True)
+            self.assertEqual(revived["pipeline"]["attempts"]["spec"], 0)
+            self.assertEqual(revived["next"]["attempt"], 1)
+
+    def test_revive_still_bounded_by_step_cap(self):
+        """되살리기를 반복해도 전체 전이 상한은 계속 막는다."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(tmp)
+            _run(root, "테스트 기능", max_attempts=1)
+            last = None
+            for _ in range(sdd.MAX_PIPELINE_STEPS + 4):
+                last = _advance(root, {})
+                if "수렴하지 않는다" in (last["pipeline"]["haltReason"] or ""):
+                    break
+                if last["next"]["action"] == "halted":
+                    _run(root, resume=True)
+            self.assertIn("수렴하지 않는다", last["pipeline"]["haltReason"])
+
+    def test_second_run_needs_restart(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(tmp)
+            _run(root, "테스트 기능")
+            clash = _run(root, "다른 기능")
+            self.assertFalse(clash["ok"])
+            fresh = _run(root, "다른 기능", restart=True)
+            self.assertTrue(fresh["started"])
+            self.assertEqual(fresh["pipeline"]["slug"], "다른-기능")
+            self.assertEqual(len(sdd.load_state(root)["pipelineHistory"]), 1)
+
+    def test_advance_rejects_stage_mismatch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(tmp)
+            _run(root, "테스트 기능")
+            bad = _advance(root, {"verdict": "approved"}, stage="review")
+            self.assertFalse(bad["ok"])
+            self.assertIn("단계가 어긋났다", bad["reason"])
+
+    def test_unreadable_verdict_halts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(tmp)
+            spec_rel = _run(root, "테스트 기능")["next"]["context"]["specPath"]
+            _write_valid_spec(root, spec_rel)
+            _advance(root, {})
+            _advance(root, {"testResult": {"passed": 1, "failed": 0}})
+            halted = _advance(root, {"notes": "좋아 보인다"})
+            self.assertEqual(halted["next"]["action"], "halted")
+            self.assertIn("리뷰 판정", halted["pipeline"]["haltReason"])
+
+    def test_step_cap_halts_runaway_loop(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(tmp)
+            spec_rel = _run(root, "테스트 기능", max_attempts=99)["next"]["context"]["specPath"]
+            _write_valid_spec(root, spec_rel)
+            _advance(root, {})
+            last = None
+            for _ in range(sdd.MAX_PIPELINE_STEPS + 2):
+                last = _advance(root, {"testResult": {"passed": 1, "failed": 0}})
+                if last["next"]["action"] == "halted":
+                    break
+                last = _advance(root, {"verdict": "changes-requested", "gaps": ["갭"]})
+                if last["next"]["action"] == "halted":
+                    break
+            self.assertEqual(last["next"]["action"], "halted")
+            self.assertIn("수렴하지 않는다", last["pipeline"]["haltReason"])
+
+    def test_next_without_pipeline_and_without_init(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.assertEqual(_next(root)["action"], "init-required")
+            _init_project(root)
+            self.assertEqual(_next(root)["action"], "none")
+
+    def test_status_exposes_pipeline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(tmp)
+            _run(root, "테스트 기능")
+            st = sdd.cmd_status(_ns(path=str(root)))
+            self.assertEqual(st["pipeline"]["stage"], "spec")
+            self.assertEqual(st["pipeline"]["feature"], "테스트 기능")
+
+    def test_advance_accepts_fenced_json(self):
+        """서브에이전트가 ```json 펜스를 붙여도 결과를 읽는다."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(tmp)
+            _run(root, "테스트 기능")
+            res = sdd.cmd_advance(_ns(path=str(root), stage=None,
+                                      result='```json\n{"openQuestions": ["q"]}\n```'))
+            self.assertTrue(res["ok"])
+            self.assertEqual(res["next"]["action"], "ask-user")
+
+
 if __name__ == "__main__":
     unittest.main()

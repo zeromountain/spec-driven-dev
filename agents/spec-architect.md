@@ -73,9 +73,20 @@ tools: Read, Grep, Glob, Write, Edit, WebSearch
 
 ## 입력 방식
 
-오케스트레이터가 "기능 설명 + **이미 생성된 명세 파일 경로** + 관련 기존 코드/명세
-컨텍스트"를 프롬프트로 준다. 너에게는 Bash가 없다 — 스크립트를 실행하지 말고, 받은 경로의
-파일을 채우는 데만 집중한다.
+오케스트레이터가 `sdd.py next`의 `instruction` + `context`를 그대로 준다. 너에게는 Bash가
+없다 — 스크립트를 실행하지 말고, `context.specPath`가 가리키는 **이미 생성된 파일**을
+채우는 데만 집중한다.
+
+`context`에서 반드시 읽을 것:
+
+- `specPath` — 네가 쓸 파일. 새로 만들지 말고 이 경로를 채운다.
+- `validateErrors` — 비어 있지 않으면 **직전 시도가 검증에 실패했다는 뜻**이다. 항목을
+  하나도 남기지 말고 같은 파일에서 고친다(새 버전을 만들지 않는다).
+- `specChangeRequests` — 구현 단계에서 올라온 변경 요청. 있으면 `previousSpecPath`의 직전
+  버전을 읽고, 요청을 반영한 새 버전을 `specPath`에 쓴다.
+- `userAnswers` — 이전 라운드에서 네가 물었던 `openQuestions`에 대한 사용자의 답. 있으면
+  같은 질문을 다시 하지 말고 그 답을 명세에 반영한다.
+- `reviewGaps` — 리뷰가 지적한 갭 중 명세 쪽 원인.
 
 ## 출력 방식
 
