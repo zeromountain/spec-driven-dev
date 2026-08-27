@@ -445,21 +445,25 @@ def _run(root: Path, feature=None, **kw):
     return sdd.cmd_run(_ns(path=str(root), feature=feature, slug=kw.get("slug"),
                            resume=kw.get("resume", False), restart=kw.get("restart", False),
                            max_attempts=kw.get("max_attempts", sdd.DEFAULT_MAX_ATTEMPTS),
-                           depth=kw.get("depth")))
+                           depth=kw.get("depth"), spec=kw.get("spec")))
 
 
-def _next(root: Path):
-    return sdd.cmd_next(_ns(path=str(root)))
+def _next(root: Path, spec=None, all=False):
+    return sdd.cmd_next(_ns(path=str(root), spec=spec, all=all))
 
 
-def _advance(root: Path, result: dict, stage=None):
+def _advance(root: Path, result: dict, stage=None, spec=None):
     import json as _json
-    return sdd.cmd_advance(_ns(path=str(root), result=_json.dumps(result), stage=stage))
+    return sdd.cmd_advance(_ns(path=str(root), result=_json.dumps(result), stage=stage,
+                               spec=spec))
 
 
 def _write_valid_spec(root: Path, rel_path: str, version: int = 1):
-    """파이프라인이 만든 빈 명세 자리에 유효한 명세를 써넣는다 (아키텍트 역할 대역)."""
-    text = VALID_SPEC
+    """파이프라인이 만든 빈 명세 자리에 유효한 명세를 써넣는다 (아키텍트 역할 대역).
+
+    프론트매터의 feature 는 파일이 놓인 디렉터리 이름과 같아야 validate 를 통과한다."""
+    text = VALID_SPEC.replace("feature: 테스트-기능",
+                              f"feature: {Path(rel_path).parent.name}")
     if version != 1:
         text = text.replace("version: 1", f"version: {version}")
     (root / rel_path).write_text(text, encoding="utf-8")
@@ -652,15 +656,25 @@ class PipelineTests(unittest.TestCase):
                     _run(root, resume=True)
             self.assertIn("수렴하지 않는다", last["pipeline"]["haltReason"])
 
-    def test_second_run_needs_restart(self):
+    def test_different_slug_starts_alongside(self):
+        """다른 기능은 막히지 않고 함께 시작된다 — 이게 병렬 실행의 진입점이다."""
         with tempfile.TemporaryDirectory() as tmp:
             root = _init_project(tmp)
             _run(root, "테스트 기능")
-            clash = _run(root, "다른 기능")
+            second = _run(root, "다른 기능")
+            self.assertTrue(second["ok"])
+            self.assertEqual(second["slug"], "다른-기능")
+            self.assertEqual(sdd.board(root)["counts"]["live"], 2)
+
+    def test_same_slug_needs_restart_or_resume(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(tmp)
+            _run(root, "테스트 기능")
+            clash = _run(root, "테스트 기능")
             self.assertFalse(clash["ok"])
-            fresh = _run(root, "다른 기능", restart=True)
+            self.assertIn("이미 진행 중", clash["reason"])
+            fresh = _run(root, "테스트 기능", restart=True)
             self.assertTrue(fresh["started"])
-            self.assertEqual(fresh["pipeline"]["slug"], "다른-기능")
             self.assertEqual(len(sdd.load_state(root)["pipelineHistory"]), 1)
 
     def test_advance_rejects_stage_mismatch(self):
@@ -972,6 +986,181 @@ class RosterPipelineTests(unittest.TestCase):
             # VALID_SPEC 자체는 light 로 판정되지만 --depth deep 이 유지돼야 한다
             self.assertEqual(after["pipeline"]["depth"], "deep")
             self.assertEqual(after["next"]["agent"], "impl-planner")
+
+
+class ParallelPipelineTests(unittest.TestCase):
+    """여러 기능을 동시에. 병렬성의 한계는 페이즈 게이트와 파일 겹침에서 온다."""
+
+    def _two(self, tmp, enforce=False):
+        root = Path(tmp)
+        sdd.cmd_init(_ns(path=str(root), enforce=enforce, specs=None, src=None, tests=None))
+        _run(root, "기능 하나")
+        _run(root, "기능 둘")
+        return root
+
+    def test_next_all_returns_both_when_gate_is_off(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._two(tmp)
+            batch = sdd.cmd_next(_ns(path=str(root), spec=None, all=True))
+            self.assertEqual(batch["action"], "batch")
+            self.assertEqual(len(batch["round"]), 2)
+            self.assertEqual({a["slug"] for a in batch["round"]}, {"기능-하나", "기능-둘"})
+            self.assertEqual(batch["waiting"], [])
+            self.assertIn("동시에", batch["concurrency"])
+
+    def test_ambiguous_next_asks_which_pipeline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._two(tmp)
+            out = sdd.cmd_next(_ns(path=str(root), spec=None, all=False))
+            self.assertEqual(out["action"], "choose-pipeline")
+            self.assertEqual(sorted(out["live"]), ["기능-둘", "기능-하나"])
+
+    def test_next_with_spec_targets_one(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._two(tmp)
+            out = sdd.cmd_next(_ns(path=str(root), spec="기능-둘", all=False))
+            self.assertEqual(out["action"], "call-agent")
+            self.assertEqual(out["pipeline"]["slug"], "기능-둘")
+
+    def test_advance_requires_spec_when_ambiguous(self):
+        """잘못 넘기면 다른 기능의 상태가 그 결과로 전이된다 — 추측하지 않는다."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._two(tmp)
+            out = _advance(root, {"openQuestions": []})
+            self.assertFalse(out["ok"])
+            self.assertIn("--spec", out["reason"])
+
+    def test_advance_routes_to_named_pipeline_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._two(tmp)
+            spec_rel = sdd.cmd_next(_ns(path=str(root), spec="기능-하나",
+                                        all=False))["context"]["specPath"]
+            _write_valid_spec(root, spec_rel)
+            out = _advance(root, {"openQuestions": []}, spec="기능-하나")
+            self.assertEqual(out["slug"], "기능-하나")
+            self.assertEqual(out["next"]["stage"], "implement")
+            pipes = sdd.load_pipelines(sdd.load_state(root))
+            self.assertEqual(pipes["기능-둘"]["stage"], "spec")   # 옆 파이프라인은 그대로
+
+    def test_enforce_serializes_across_phases(self):
+        """게이트가 켜져 있으면 페이즈가 다른 파이프라인은 기다린다."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._two(tmp, enforce=True)
+            spec_rel = sdd.cmd_next(_ns(path=str(root), spec="기능-하나",
+                                        all=False))["context"]["specPath"]
+            _write_valid_spec(root, spec_rel)
+            _advance(root, {"openQuestions": []}, spec="기능-하나")   # → implement
+
+            batch = sdd.cmd_next(_ns(path=str(root), spec=None, all=True))
+            slugs = [a["slug"] for a in batch["round"]]
+            waiting = [w["slug"] for w in batch["waiting"]]
+            self.assertEqual(len(slugs), 1)
+            self.assertEqual(len(waiting), 1)
+            self.assertNotEqual(slugs[0], waiting[0])
+            self.assertIn("페이즈 게이트", batch["waiting"][0]["reason"])
+
+    def test_enforce_runs_same_phase_together(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._two(tmp, enforce=True)
+            batch = sdd.cmd_next(_ns(path=str(root), spec=None, all=True))
+            self.assertEqual(len(batch["round"]), 2)      # 둘 다 spec 단계다
+            self.assertEqual(batch["waiting"], [])
+
+    def test_phase_moves_on_when_nobody_can_act(self):
+        """현재 페이즈에서 아무도 못 움직이면 게이트가 기다리는 쪽으로 넘어간다."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sdd.cmd_init(_ns(path=str(root), enforce=True, specs=None, src=None, tests=None))
+            _run(root, "기능 하나")
+            spec_rel = _next(root)["context"]["specPath"]
+            _write_valid_spec(root, spec_rel)
+            _advance(root, {"openQuestions": []})        # 유일한 파이프라인 → implement
+            sdd.transition_phase(root, "spec")           # 페이즈만 spec 으로 되돌려 놓는다
+            batch = sdd.cmd_next(_ns(path=str(root), spec=None, all=True))
+            self.assertEqual(batch["waiting"], [])
+            self.assertEqual(batch["round"][0]["stage"], "implement")
+
+    def test_overlapping_implement_files_serialize(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sdd.cmd_init(_ns(path=str(root), enforce=False, specs=None, src=None, tests=None))
+            for name in ("기능 하나", "기능 둘"):
+                _run(root, name)
+            state = sdd.load_state(root)
+            pipes = sdd.load_pipelines(state)
+            for slug in pipes:
+                pipes[slug]["stage"] = "implement"
+                pipes[slug]["carry"]["plan"] = {"tasks": [{"files": ["src/shared.py"]}]}
+            sdd._store_pipelines(state, pipes)
+            sdd.write_json(root / ".sdd" / "state.json", state)
+
+            sched = sdd.schedule(root)
+            self.assertEqual(len(sched["runnable"]), 1)
+            self.assertEqual(len(sched["waiting"]), 1)
+            self.assertIn("같은 파일", sched["waiting"][0]["reason"])
+
+    def test_disjoint_implement_files_run_together(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sdd.cmd_init(_ns(path=str(root), enforce=False, specs=None, src=None, tests=None))
+            for name in ("기능 하나", "기능 둘"):
+                _run(root, name)
+            state = sdd.load_state(root)
+            pipes = sdd.load_pipelines(state)
+            for slug, f in zip(sorted(pipes), ("src/a.py", "src/b.py")):
+                pipes[slug]["stage"] = "implement"
+                pipes[slug]["carry"]["plan"] = {"tasks": [{"files": [f]}]}
+            sdd._store_pipelines(state, pipes)
+            sdd.write_json(root / ".sdd" / "state.json", state)
+
+            sched = sdd.schedule(root)
+            self.assertEqual(len(sched["runnable"]), 2)
+
+    def test_unplanned_implement_serializes(self):
+        """계획이 없으면 파일 범위를 모른다 — 추측으로 동시에 돌리지 않는다."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sdd.cmd_init(_ns(path=str(root), enforce=False, specs=None, src=None, tests=None))
+            for name in ("기능 하나", "기능 둘"):
+                _run(root, name)
+            state = sdd.load_state(root)
+            pipes = sdd.load_pipelines(state)
+            for slug in pipes:
+                pipes[slug]["stage"] = "implement"
+            sdd._store_pipelines(state, pipes)
+            sdd.write_json(root / ".sdd" / "state.json", state)
+
+            sched = sdd.schedule(root)
+            self.assertEqual(len(sched["runnable"]), 1)
+            self.assertIn("계획이 없어", sched["waiting"][0]["reason"])
+
+    def test_legacy_single_pipeline_state_migrates(self):
+        """0.5.0 이전 state.json 은 pipeline 하나만 갖고 있다."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(tmp)
+            _run(root, "옛날 기능")
+            state = sdd.load_state(root)
+            legacy = state["pipelines"]["옛날-기능"]
+            sdd.write_json(root / ".sdd" / "state.json", {
+                "version": 1, "phase": "spec", "enforce": False,
+                "activeSpec": "옛날-기능", "pipeline": legacy, "updatedAt": None,
+            })
+            self.assertEqual(sorted(sdd.load_pipelines(sdd.load_state(root))), ["옛날-기능"])
+            self.assertEqual(_next(root)["pipeline"]["slug"], "옛날-기능")
+
+    def test_abort_all_stops_every_live_pipeline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._two(tmp)
+            out = sdd.cmd_abort(_ns(path=str(root), reason="정리", spec=None, all=True))
+            self.assertEqual(sorted(out["aborted"]), ["기능-둘", "기능-하나"])
+            self.assertEqual(sdd.board(root)["counts"]["live"], 0)
+
+    def test_board_lists_every_pipeline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._two(tmp)
+            b = sdd.board(root)
+            self.assertEqual(b["counts"], {"total": 2, "live": 2, "runnable": 2, "waiting": 0})
+            self.assertTrue(all(r["scheduled"] == "runnable" for r in b["pipelines"]))
 
 if __name__ == "__main__":
     unittest.main()

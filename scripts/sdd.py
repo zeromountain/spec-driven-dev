@@ -48,6 +48,8 @@ DEFAULT_STATE = {
     "phase": "off",
     "enforce": False,
     "activeSpec": None,
+    "pipelines": {},
+    "activePipeline": None,
     "depth": "light",
     "updatedAt": None,
 }
@@ -1057,7 +1059,9 @@ def cmd_status(args) -> dict:
         "depth": state.get("depth", DEFAULT_STATE["depth"]),
         "specs": listing["specs"],
         "guardViolations": violations,
-        "pipeline": pipeline_summary(state.get("pipeline")),
+        "pipeline": pipeline_summary(load_pipelines(state).get(
+            resolve_pipeline_slug(state, allow_active=True) or "")),
+        "board": board(root),
     }
 
 
@@ -1255,12 +1259,73 @@ def _new_pipeline(feature: str, slug: str, max_attempts: int) -> dict:
     }
 
 
-def _persist_pipeline(root: Path, pipe: dict) -> None:
-    """state.json을 새로 읽어 pipeline만 갈아끼운다 — transition_phase가 중간에
+# ---------------------------------------------------------------------------
+# 파이프라인 레지스트리 (기능마다 하나씩, 동시에 여러 개)
+# ---------------------------------------------------------------------------
+#
+# 병렬성의 한계는 **페이즈 게이트가 프로젝트 전역 자원**이라는 데서 온다. 훅의 stdin에
+# 호출자 정보가 없으므로 게이트는 "지금 이 프로젝트가 어떤 페이즈인가" 하나만 알 수 있다.
+# 그래서 enforce:true 에서는 같은 페이즈에 있는 파이프라인끼리만 동시에 움직인다.
+# enforce:false 에서는 게이트가 무동작이므로 페이즈가 서로 달라도 함께 돈다.
+
+LIVE_STATUSES = ("running", "awaiting-user")
+
+
+def load_pipelines(state: dict) -> dict:
+    """{slug: pipeline}. 단일 `pipeline` 필드만 있던 구버전 상태를 그 자리에서 옮긴다."""
+    pipes = state.get("pipelines")
+    if not isinstance(pipes, dict):
+        pipes = {}
+    legacy = state.get("pipeline")
+    if isinstance(legacy, dict) and legacy.get("slug") and legacy["slug"] not in pipes:
+        pipes[legacy["slug"]] = legacy
+    return pipes
+
+
+def _store_pipelines(state: dict, pipes: dict) -> None:
+    state["pipelines"] = pipes
+    # 구버전 필드는 "지금 초점이 가 있는 것" 하나로만 유지한다 — 예전 리더가 읽어도
+    # 최소한 하나는 보인다. 정본은 pipelines 다.
+    focus = state.get("activePipeline")
+    state["pipeline"] = pipes.get(focus) if focus in pipes else (
+        next(iter(pipes.values()), None))
+
+
+def live_pipelines(pipes: dict) -> dict:
+    return {s: p for s, p in pipes.items() if p.get("status") in LIVE_STATUSES}
+
+
+def resolve_pipeline_slug(state: dict, explicit=None, allow_active=False):
+    """대상 파이프라인을 정한다. 명시 → (허용하면) activePipeline → 살아 있는 게 하나뿐.
+
+    **여러 개가 살아 있을 때는 기본적으로 추측하지 않는다(None).** 특히 `advance` 는
+    결과를 엉뚱한 파이프라인에 먹이면 그 기능의 상태가 남의 결과로 전이되고, 그건
+    조용히 잘못된다. `allow_active` 는 표시용·재개용처럼 틀려도 파괴적이지 않은
+    호출에서만 켠다."""
+    pipes = load_pipelines(state)
+    if explicit:
+        return explicit if explicit in pipes else None
+    live = live_pipelines(pipes)
+    if len(live) == 1:
+        return next(iter(live))
+    active = state.get("activePipeline")
+    if allow_active and active in pipes:
+        return active
+    if len(live) > 1:
+        return None
+    return active if active in pipes else next(iter(pipes), None)
+
+
+def _persist_pipeline(root: Path, pipe: dict, focus: bool = True) -> None:
+    """state.json을 새로 읽어 이 파이프라인만 갈아끼운다 — transition_phase가 중간에
     같은 파일을 쓰기 때문에 통째로 덮어쓰면 phase 변경이 유실된다."""
     pipe["updatedAt"] = now_iso()
     state = load_state(root)
-    state["pipeline"] = pipe
+    pipes = load_pipelines(state)
+    pipes[pipe["slug"]] = pipe
+    if focus:
+        state["activePipeline"] = pipe["slug"]
+    _store_pipelines(state, pipes)
     state["updatedAt"] = now_iso()
     write_json(root / ".sdd" / "state.json", state)
 
@@ -1345,16 +1410,196 @@ def _tail_history(pipe: dict, n: int = 6):
     return pipe.get("history", [])[-n:]
 
 
-def compute_next(root: Path) -> dict:
+# ---------------------------------------------------------------------------
+# 스케줄러 — 지금 동시에 움직여도 되는 파이프라인은 무엇인가
+# ---------------------------------------------------------------------------
+
+def planned_files(pipe: dict) -> set:
+    """impl-planner 가 확정한 '건드릴 파일' 집합. 계획이 없으면 빈 집합(=알 수 없음)."""
+    plan = (pipe.get("carry") or {}).get("plan") or {}
+    files = set()
+    for task in plan.get("tasks") or []:
+        if isinstance(task, dict):
+            files.update(f for f in (task.get("files") or []) if isinstance(f, str))
+    files.update(f for f in (pipe.get("carry") or {}).get("filesChanged") or []
+                 if isinstance(f, str))
+    return files
+
+
+def implement_conflicts(pipe: dict, others) -> list:
+    """구현 단계를 동시에 돌려도 되는지. 같은 파일을 건드리면 나중 쓰기가 앞을 덮는다.
+
+    계획(impl-planner)이 있어야 파일 집합을 알 수 있다. 경량 모드처럼 계획이 없으면
+    **모른다 = 겹칠 수 있다**로 보고 직렬화한다 — 추측으로 동시에 돌리지 않는다."""
+    mine = planned_files(pipe)
+    blockers = []
+    for other in others:
+        theirs = planned_files(other)
+        if not mine or not theirs:
+            blockers.append({"slug": other["slug"], "reason": "계획이 없어 파일 범위를 알 수 없다"})
+            continue
+        overlap = sorted(mine & theirs)
+        if overlap:
+            blockers.append({"slug": other["slug"],
+                             "reason": "같은 파일을 건드린다: " + ", ".join(overlap[:3])})
+    return blockers
+
+
+def schedule(root: Path) -> dict:
+    """이번 라운드에 움직일 파이프라인과, 기다려야 하는 파이프라인을 정한다.
+
+    이 판단을 모델에게 맡기면 두 서브에이전트가 같은 파일을 동시에 고쳐 한쪽 작업이
+    조용히 사라진다. 그래서 여기서 결정론적으로 정한다."""
+    state = load_state(root)
+    pipes = load_pipelines(state)
+    live = live_pipelines(pipes)
+    enforce = bool(state.get("enforce"))
+    phase = state.get("phase", "off")
+
+    if not live:
+        return {"phase": phase, "enforce": enforce, "runnable": [], "waiting": [],
+                "live": 0}
+
+    ready = [p for p in live.values() if p.get("status") == "running"]
+    asking = [p for p in live.values() if p.get("status") == "awaiting-user"]
+
+    def by_age(items):
+        # 오래 기다린 것부터 — 굶는 파이프라인이 생기지 않게 한다.
+        return sorted(items, key=lambda p: (p.get("updatedAt") or "", p["slug"]))
+
+    waiting = []
+    if enforce:
+        # 게이트가 프로젝트 전역이므로 같은 페이즈끼리만 함께 움직인다.
+        candidates = [p for p in ready if p.get("stage") == phase]
+        if not candidates:
+            # 현재 페이즈에서 움직일 수 있는 게 없다 → 가장 오래 기다린 쪽으로 페이즈를 넘긴다.
+            oldest = by_age(ready)
+            if oldest:
+                phase = oldest[0].get("stage")
+                candidates = [p for p in ready if p.get("stage") == phase]
+        for p in ready:
+            if p not in candidates:
+                waiting.append({"slug": p["slug"], "stage": p.get("stage"),
+                                "reason": f"페이즈 게이트가 지금 '{phase}' 를 잡고 있다 "
+                                          f"(enforce:true 에서는 같은 페이즈끼리만 동시에 돈다)"})
+    else:
+        candidates = list(ready)
+
+    # 구현 단계는 파일이 겹치면 동시에 돌릴 수 없다 — 페이즈와 무관한 제약이다.
+    runnable = []
+    for p in by_age(candidates):
+        if p.get("stage") == "implement":
+            conflicts = implement_conflicts(p, [q for q in runnable if q.get("stage") == "implement"])
+            if conflicts:
+                waiting.append({"slug": p["slug"], "stage": "implement",
+                                "reason": "구현 파일이 겹친다 — " + conflicts[0]["reason"],
+                                "blockedBy": [c["slug"] for c in conflicts]})
+                continue
+        runnable.append(p)
+
+    return {
+        "phase": phase,
+        "enforce": enforce,
+        "live": len(live),
+        "runnable": [p["slug"] for p in runnable],
+        "waiting": waiting,
+        "awaitingUser": [p["slug"] for p in asking],
+    }
+
+
+def board(root: Path) -> dict:
+    """모든 파이프라인의 현재 위치를 한 장으로. 사용자에게 보여줄 표의 원본이다."""
+    state = load_state(root)
+    pipes = load_pipelines(state)
+    sched = schedule(root)
+    runnable = set(sched["runnable"])
+    waiting = {w["slug"]: w for w in sched["waiting"]}
+    rows = []
+    for slug, pipe in sorted(pipes.items()):
+        row = pipeline_summary(pipe)
+        row["slug"] = slug
+        if pipe.get("status") == "running":
+            row["scheduled"] = "runnable" if slug in runnable else "waiting"
+            if slug in waiting:
+                row["waitReason"] = waiting[slug]["reason"]
+        else:
+            row["scheduled"] = pipe.get("status")
+        rows.append(row)
+    return {"phase": sched["phase"], "enforce": sched["enforce"],
+            "activePipeline": state.get("activePipeline"),
+            "counts": {"total": len(pipes), "live": sched["live"],
+                       "runnable": len(sched["runnable"]),
+                       "waiting": len(sched["waiting"])},
+            "pipelines": rows}
+
+
+def compute_next_all(root: Path) -> dict:
+    """이번 라운드에 **동시에** 호출해도 되는 행동들. 병렬 실행의 진입점이다."""
+    if not (root / ".sdd" / "state.json").exists():
+        return {"action": "init-required",
+                "message": "이 프로젝트에는 아직 SDD가 설정되지 않았다 — 먼저 `sdd.py init` 을 실행하라"}
+    sched = schedule(root)
+    if not sched["live"]:
+        return {"action": "none", "board": board(root),
+                "message": "진행 중인 파이프라인이 없다 — `sdd.py run \"<기능 설명>\"` 으로 시작하라"}
+
+    actions = []
+    for slug in sched["runnable"]:
+        nxt = compute_next(root, slug)
+        nxt["slug"] = slug
+        actions.append(nxt)
+    for slug in sched.get("awaitingUser", []):
+        nxt = compute_next(root, slug)
+        nxt["slug"] = slug
+        actions.append(nxt)
+
+    return {
+        "action": "batch",
+        "round": actions,
+        "waiting": sched["waiting"],
+        "board": board(root),
+        "concurrency": "위 항목들은 **한 메시지에서 동시에** 호출해도 안전하다 — 스케줄러가 "
+                       "페이즈와 구현 파일 겹침을 이미 확인했다. 각 결과는 "
+                       "`advance --spec <slug>` 로 따로 넘긴다.",
+        "then": "이 라운드를 전부 advance 한 뒤 `next --all` 을 다시 불러라. waiting 에 있던 "
+                "파이프라인은 자리가 나면 자동으로 runnable 로 올라온다",
+    }
+
+
+def compute_next(root: Path, slug=None) -> dict:
     if not (root / ".sdd" / "state.json").exists():
         return {"action": "init-required",
                 "message": "이 프로젝트에는 아직 SDD가 설정되지 않았다 — 먼저 `sdd.py init` 을 실행하라"}
 
     state = load_state(root)
-    pipe = state.get("pipeline")
-    if not pipe:
+    pipes = load_pipelines(state)
+    if not pipes:
         return {"action": "none",
                 "message": "진행 중인 파이프라인이 없다 — `sdd.py run \"<기능 설명>\"` 으로 시작하라"}
+
+    target = resolve_pipeline_slug(state, slug)
+    if target is None:
+        live = sorted(live_pipelines(pipes))
+        if slug:
+            return {"action": "unknown-pipeline", "requested": slug,
+                    "pipelines": sorted(pipes),
+                    "message": f"'{slug}' 라는 파이프라인이 없다"}
+        return {"action": "choose-pipeline", "live": live,
+                "board": board(root),
+                "message": "살아 있는 파이프라인이 여럿이다 — `--spec <슬러그>` 로 대상을 "
+                           "지정하거나 `next --all` 로 이번 라운드에 동시에 돌릴 것을 받아라"}
+
+    pipe = pipes[target]
+    sched = schedule(root)
+    if (pipe.get("status") == "running" and sched["runnable"]
+            and target not in sched["runnable"]):
+        blocked = next((w for w in sched["waiting"] if w["slug"] == target), None)
+        return {"action": "waiting", "pipeline": pipeline_summary(pipe),
+                "reason": (blocked or {}).get("reason"),
+                "blockedBy": (blocked or {}).get("blockedBy") or sched["runnable"],
+                "board": board(root),
+                "message": "이 파이프라인은 지금 움직일 수 없다 — 먼저 진행 가능한 쪽을 "
+                           "돌리면 자리가 난다. `next --all` 이 이번 라운드의 목록을 준다"}
 
     status = pipe.get("status")
     if status == "done":
@@ -1369,7 +1614,8 @@ def compute_next(root: Path) -> dict:
     if status == "awaiting-user":
         return {"action": "ask-user", "pipeline": pipeline_summary(pipe),
                 "questions": pipe["carry"].get("openQuestions", []),
-                "then": "사용자 답을 `sdd.py advance --result '{\"answers\": {...}}'` 로 넘겨라"}
+                "then": "사용자 답을 `sdd.py advance --spec " + pipe["slug"]
+                        + " --result '{\"answers\": {...}}'` 로 넘겨라"}
 
     stage = pipe.get("stage")
     if stage not in PIPELINE_STAGES:
@@ -1886,15 +2132,26 @@ def cmd_run(args) -> dict:
                 "reason": "이 프로젝트에는 아직 SDD가 설정되지 않았다 — 먼저 `sdd.py init` 을 실행하라"}
 
     state = load_state(root)
-    pipe = state.get("pipeline")
+    pipes = load_pipelines(state)
     feature = (getattr(args, "feature", None) or "").strip()
-    live = pipe and pipe.get("status") in ("running", "awaiting-user")
+    explicit = getattr(args, "spec", None)
+
+    # 새 기능이면 그 슬러그의 파이프라인을 본다. 다른 기능이 돌고 있어도 막지 않는다 —
+    # 여러 기능을 동시에 진행하는 것이 이 레지스트리의 목적이다.
+    slug = slugify(args.slug) if getattr(args, "slug", None) else (
+        slugify(feature) if feature else None)
+    target = explicit or slug or resolve_pipeline_slug(state, allow_active=True)
+    pipe = pipes.get(target)
     resumable = pipe and pipe.get("status") in ("running", "awaiting-user", "halted")
 
-    if live and feature and not args.restart:
-        return {"ok": False, "reason": "이미 진행 중인 파이프라인이 있다",
+    if pipe and pipe.get("status") in LIVE_STATUSES and feature and not args.restart \
+            and not args.resume:
+        return {"ok": False, "reason": f"'{target}' 파이프라인이 이미 진행 중이다",
                 "pipeline": pipeline_summary(pipe),
-                "hint": "그대로 이어가려면 `run --resume`, 버리고 새로 시작하려면 `run \"<설명>\" --restart`"}
+                "board": board(root),
+                "hint": "그대로 이어가려면 `run --resume --spec " + str(target)
+                        + "`, 버리고 다시 시작하려면 `--restart`. **다른 기능**을 함께 "
+                          "돌리려면 그냥 다른 설명으로 `run \"<다른 기능>\"` 하면 된다"}
 
     if (args.resume or not feature) and resumable:
         revived = pipe.get("status") == "halted"
@@ -1906,11 +2163,17 @@ def cmd_run(args) -> dict:
             pipe["attempts"] = {k: 0 for k in pipe["attempts"]}
         _record(pipe, "revived" if revived else "resumed")
         _persist_pipeline(root, pipe)
-        return {"ok": True, "resumed": True, "pipeline": pipeline_summary(pipe),
-                "history": _tail_history(pipe), "next": compute_next(root)}
+        return {"ok": True, "resumed": True, "slug": pipe["slug"],
+                "pipeline": pipeline_summary(pipe),
+                "history": _tail_history(pipe), "board": board(root),
+                "next": compute_next(root, pipe["slug"])}
 
     if not feature:
-        return {"ok": False, "reason": "재개할 파이프라인이 없다 — 기능 설명을 인자로 줘라"}
+        live = sorted(live_pipelines(pipes))
+        return {"ok": False, "board": board(root),
+                "reason": ("재개할 파이프라인이 없다 — 기능 설명을 인자로 줘라" if not live
+                           else "재개 대상이 모호하다 — `--spec <슬러그>` 로 지정하라"),
+                "live": live}
 
     if pipe:
         archive = state.setdefault("pipelineHistory", [])
@@ -1918,21 +2181,34 @@ def cmd_run(args) -> dict:
         del archive[:-5]
         write_json(root / ".sdd" / "state.json", state)
 
-    slug = slugify(args.slug) if args.slug else slugify(feature)
     pipe = _new_pipeline(feature, slug, args.max_attempts)
     pipe["forcedDepth"] = getattr(args, "depth", None)
     d = refresh_roster(root, pipe)
     _record(pipe, "started", feature=feature, slug=slug, depth=d["depth"])
     _persist_pipeline(root, pipe)
-    return {"ok": True, "started": True, "pipeline": pipeline_summary(pipe),
-            "depth": {"depth": d["depth"], "forcedTo": d["forcedTo"],
-                      "deepReasons": d["deepReasons"], "agents": d["agents"],
-                      "agentCount": sum(len(v) for v in d["agents"].values())},
-            "next": compute_next(root)}
+    result = {"ok": True, "started": True, "slug": slug,
+              "pipeline": pipeline_summary(pipe),
+              "depth": {"depth": d["depth"], "forcedTo": d["forcedTo"],
+                        "deepReasons": d["deepReasons"], "agents": d["agents"],
+                        "agentCount": sum(len(v) for v in d["agents"].values())},
+              "next": compute_next(root, slug)}
+    brd = board(root)
+    if brd["counts"]["live"] > 1:
+        result["board"] = brd
+        result["note"] = (f"파이프라인 {brd['counts']['live']}개가 함께 살아 있다 — "
+                          "`next --all` 로 이번 라운드에 동시에 돌릴 것을 받아라")
+    return result
 
 
 def cmd_next(args) -> dict:
-    return compute_next(Path(args.path).resolve())
+    root = Path(args.path).resolve()
+    if getattr(args, "all", False):
+        return compute_next_all(root)
+    return compute_next(root, getattr(args, "spec", None))
+
+
+def cmd_board(args) -> dict:
+    return board(Path(args.path).resolve())
 
 
 RESULT_FENCE_RE = re.compile(r"^\s*(?:```|~~~)[a-zA-Z]*\s*\n(.*?)\n\s*(?:```|~~~)\s*$", re.DOTALL)
@@ -1959,12 +2235,21 @@ def _parse_result(raw: str) -> dict:
 def cmd_advance(args) -> dict:
     root = Path(args.path).resolve()
     state = load_state(root)
-    pipe = state.get("pipeline")
-    if not pipe:
+    pipes = load_pipelines(state)
+    if not pipes:
         return {"ok": False, "reason": "진행 중인 파이프라인이 없다"}
+
+    target = resolve_pipeline_slug(state, getattr(args, "spec", None))
+    if target is None:
+        return {"ok": False, "board": board(root),
+                "reason": ("살아 있는 파이프라인이 여럿이다 — 결과가 어느 것인지 "
+                           "`--spec <슬러그>` 로 밝혀라. 잘못 넘기면 다른 기능의 상태가 "
+                           "그 결과로 전이된다"),
+                "live": sorted(live_pipelines(pipes))}
+    pipe = pipes[target]
     if pipe.get("status") in ("done", "halted"):
-        return {"ok": False, "reason": f"파이프라인이 이미 {pipe['status']} 상태다",
-                "pipeline": pipeline_summary(pipe), "next": compute_next(root)}
+        return {"ok": False, "reason": f"'{target}' 파이프라인이 이미 {pipe['status']} 상태다",
+                "pipeline": pipeline_summary(pipe), "next": compute_next(root, target)}
 
     try:
         result = _parse_result(args.result)
@@ -1993,21 +2278,41 @@ def cmd_advance(args) -> dict:
              "review": _advance_review}[stage_before](root, pipe, result)
 
     _persist_pipeline(root, pipe)
-    return {"ok": True, "stageBefore": stage_before,
-            "pipeline": pipeline_summary(pipe),
-            "recorded": _tail_history(pipe, 3),
-            "next": compute_next(root)}
+    out = {"ok": True, "slug": target, "stageBefore": stage_before,
+           "pipeline": pipeline_summary(pipe),
+           "recorded": _tail_history(pipe, 3),
+           "next": compute_next(root, target)}
+    brd = board(root)
+    if brd["counts"]["live"] > 1:
+        out["board"] = brd
+    return out
 
 
 def cmd_abort(args) -> dict:
     root = Path(args.path).resolve()
     state = load_state(root)
-    pipe = state.get("pipeline")
-    if not pipe:
+    pipes = load_pipelines(state)
+    if not pipes:
         return {"ok": False, "reason": "진행 중인 파이프라인이 없다"}
-    _halt(pipe, args.reason or "사용자가 중단했다")
+    reason = args.reason or "사용자가 중단했다"
+
+    if getattr(args, "all", False):
+        stopped = []
+        for slug, pipe in sorted(live_pipelines(pipes).items()):
+            _halt(pipe, reason)
+            _persist_pipeline(root, pipe, focus=False)
+            stopped.append(slug)
+        return {"ok": True, "aborted": stopped, "board": board(root)}
+
+    target = resolve_pipeline_slug(state, getattr(args, "spec", None))
+    if target is None:
+        return {"ok": False, "board": board(root),
+                "reason": "살아 있는 파이프라인이 여럿이다 — `--spec <슬러그>` 또는 `--all`",
+                "live": sorted(live_pipelines(pipes))}
+    pipe = pipes[target]
+    _halt(pipe, reason)
     _persist_pipeline(root, pipe)
-    return {"ok": True, "pipeline": pipeline_summary(pipe)}
+    return {"ok": True, "slug": target, "pipeline": pipeline_summary(pipe)}
 
 
 # ---------------------------------------------------------------------------
@@ -2100,11 +2405,20 @@ def build_parser() -> argparse.ArgumentParser:
                     dest="max_attempts", help=f"단계별 재시도 상한 (기본: {DEFAULT_MAX_ATTEMPTS})")
     sp.add_argument("--depth", default=None, choices=["light", "deep"],
                     help="자동 깊이 판정을 덮어쓴다 (파이프라인 내내 유지된다)")
+    sp.add_argument("--spec", default=None,
+                    help="재개할 파이프라인 슬러그 (여러 개가 살아 있을 때)")
     sp.set_defaults(func=cmd_run)
 
-    sp = sub.add_parser("next", help="파이프라인의 다음 행동 하나를 지시한다")
+    sp = sub.add_parser("next", help="다음 행동을 지시한다 (--all 이면 동시 실행 가능한 전부)")
     add_path(sp)
+    sp.add_argument("--spec", default=None, help="대상 파이프라인 슬러그")
+    sp.add_argument("--all", action="store_true",
+                    help="이번 라운드에 동시에 호출해도 되는 행동을 전부 낸다")
     sp.set_defaults(func=cmd_next)
+
+    sp = sub.add_parser("board", help="모든 파이프라인의 위치·실행 가능 여부를 한 장으로")
+    add_path(sp)
+    sp.set_defaults(func=cmd_board)
 
     sp = sub.add_parser("advance", help="서브에이전트 결과를 넘겨 다음 단계로 전이한다")
     add_path(sp)
@@ -2112,11 +2426,15 @@ def build_parser() -> argparse.ArgumentParser:
                     help="결과 JSON 문자열, @파일경로, 또는 - (stdin)")
     sp.add_argument("--stage", default=None, choices=list(PIPELINE_STAGES),
                     help="결과를 낸 단계 (주면 어긋남을 검사한다)")
+    sp.add_argument("--spec", default=None,
+                    help="결과를 낸 파이프라인 슬러그 (여러 개가 살아 있으면 필수)")
     sp.set_defaults(func=cmd_advance)
 
     sp = sub.add_parser("abort", help="진행 중인 파이프라인을 중단한다")
     add_path(sp)
     sp.add_argument("--reason", default=None, help="중단 사유")
+    sp.add_argument("--spec", default=None, help="중단할 파이프라인 슬러그")
+    sp.add_argument("--all", action="store_true", help="살아 있는 파이프라인을 전부 중단한다")
     sp.set_defaults(func=cmd_abort)
 
     return p

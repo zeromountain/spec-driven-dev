@@ -8,8 +8,8 @@ repository.
 A standalone Claude Code plugin (also a self-hosted marketplace, following the same layout as
 `zeromountain/auto-dev`). It ships a single plugin, `sdd`, that scaffolds and runs a
 Spec-Driven Development harness in any target project: specs as the source of truth, ten
-role-bound subagents across three phases, a pipeline state machine in `sdd.py` that decides
-the next action, and an opt-in PreToolUse hook that enforces each *phase's* write boundaries
+role-bound subagents across three phases, a registry of pipeline state machines in `sdd.py` (one per
+feature, running concurrently) that decides the next action and what may run at the same time, and an opt-in PreToolUse hook that enforces each *phase's* write boundaries
 by file path.
 
 The ten agents, by phase (bold = also runs in light mode):
@@ -81,6 +81,15 @@ Keep the two manifests' `version` fields in lockstep — `scripts/validate.py` e
   skill to pick agents on vibes. `depth_haystack()` excludes the spec's `범위 밖` section and
   unfilled `{{...}}` placeholders: an exclusion clause and the template's own boilerplate are
   not signals.
+- **Concurrency is decided by `schedule()`, not by the model.** Pipelines live in
+  `state["pipelines"][slug]`; `activePipeline` is only a focus hint. Two constraints bound
+  parallelism and both are structural, not stylistic: the phase gate is *project-wide* (the
+  PreToolUse payload has no caller identity), so under `enforce: true` only same-phase
+  pipelines advance together; and implement-stage pipelines serialize unless
+  `impl-planner` gave disjoint `tasks[].files` — no plan means "unknown, assume overlap".
+  `advance` refuses to guess a target when several pipelines are live, because feeding a
+  result to the wrong pipeline corrupts it silently. Keep `load_pipelines()`'s migration of
+  the pre-0.6.0 single `pipeline` field working whenever you touch the registry.
 - **Reviewers are called together, never in sequence.** The review stage emits
   `action: "call-agents"` (even when the roster holds one) and `advance` takes
   `{"reviews": [...]}`. `combine_verdicts()` takes the worst verdict, never an average, and

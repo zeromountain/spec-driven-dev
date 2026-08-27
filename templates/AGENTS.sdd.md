@@ -48,8 +48,15 @@ Security Reviewer(입력 검증·인가·시크릿) · Performance Reviewer(N+1�
 멈추는 경우는 두 가지뿐이다: 명세 단계에서 사용자에게 물어야 할 미결 질문이 생겼을 때,
 그리고 재시도 상한에 걸렸을 때(기본 단계별 2회).
 
+### 여러 기능을 동시에
+
+`/sdd:run`은 다른 기능이면 막지 않는다 — 기능마다 파이프라인이 하나씩 생긴다.
+`/sdd:board`가 전체 현황을, `sdd.py next --all`이 이번 라운드에 동시에 돌려도 되는 것을
+알려준다. 하드 게이트가 켜져 있으면 같은 페이즈끼리만 동시에 돌고, 구현 단계는 파일이
+겹치면 직렬화된다.
+
 ### 명령
 
-`/sdd:run` · `/sdd:audit` · `/sdd:spec` · `/sdd:implement` · `/sdd:review` · `/sdd:status` · `/sdd:phase`.
+`/sdd:run` · `/sdd:board` · `/sdd:audit` · `/sdd:spec` · `/sdd:implement` · `/sdd:review` · `/sdd:status` · `/sdd:phase`.
 `/sdd:spec`·`/sdd:implement`·`/sdd:review`는 파이프라인을 한 스텝만 진행시키는 수동 경로다.
 자세한 사용법은 `sdd` 플러그인의 `spec-driven-dev` 스킬을 참고한다.
