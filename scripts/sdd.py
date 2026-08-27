@@ -464,14 +464,17 @@ def find_ac_tags_in_tests(test_dirs, ac_pattern: str, project_root: Path):
             if not f.is_file() or f.suffix.lower() in TEXT_EXCLUDE_SUFFIXES:
                 continue
             try:
-                lines = f.read_text(encoding="utf-8", errors="ignore").splitlines()
+                text = f.read_text(encoding="utf-8", errors="ignore")
             except OSError:
                 continue
-            for i, line in enumerate(lines, start=1):
+            # 대부분의 파일에는 태그가 없다. 줄 단위 루프 전에 통짜로 한 번 걸러
+            # 테스트 트리가 커질수록 벌어지는 비용을 줄인다.
+            if not pattern.search(text):
+                continue
+            rel = f.relative_to(project_root).as_posix()
+            for i, line in enumerate(text.splitlines(), start=1):
                 for m in pattern.finditer(line):
-                    hits.setdefault(m.group(0), []).append(
-                        f"{f.relative_to(project_root).as_posix()}:{i}"
-                    )
+                    hits.setdefault(m.group(0), []).append(f"{rel}:{i}")
     return hits
 
 
@@ -1315,6 +1318,7 @@ def _new_pipeline(feature: str, slug: str, max_attempts: int) -> dict:
             "filesChanged": [],
             "implementationDefects": [],
             "reviewVerdicts": [],
+            "reviewResults": [],
         },
         "history": [],
         "haltReason": None,
@@ -1544,6 +1548,7 @@ def _enter_stage(pipe: dict, stage: str, agent_index: int = 0) -> None:
     if stage != "review":
         pipe["reviewPath"] = None
         pipe["carry"]["reviewVerdicts"] = []
+        pipe["carry"]["reviewResults"] = []
     _record(pipe, "stage-entered", stage=stage, agentIndex=agent_index)
 
 
@@ -1853,8 +1858,13 @@ def _call_agent(pipe: dict, stage: str, context: dict, instruction: str, phase=N
 
 def _call_reviewers(pipe: dict, context: dict, instruction: str, phase=None) -> dict:
     """리뷰어는 하나씩이 아니라 **한 번에** 부른다. 순차로 부르며 앞선 판정을 넘기면
-    독립성이 깨지고, 먼저 나온 관심사가 뒤의 것을 덮는다."""
-    roster = stage_roster(pipe, "review")
+    독립성이 깨지고, 먼저 나온 관심사가 뒤의 것을 덮는다.
+
+    이미 판정을 낸 리뷰어는 빼고 요청한다 — 한 명이 형식을 어겨 다시 들어왔을 때
+    나머지를 재실행하지 않기 위해서다."""
+    full = stage_roster(pipe, "review")
+    roster = pending_reviewers(pipe) or full
+    done = [n for n in full if n not in roster]
     signals = pipe.get("depthSignals") or {}
     return {
         "action": "call-agents",
@@ -1873,6 +1883,8 @@ def _call_reviewers(pipe: dict, context: dict, instruction: str, phase=None) -> 
         ],
         "stage": "review",
         "roster": roster,
+        "fullRoster": full,
+        "alreadyReported": done,
         "depth": pipe.get("depth"),
         "attempt": pipe["attempts"].get("review", 0) + 1,
         "maxAttempts": pipe["maxAttempts"],
@@ -1881,9 +1893,10 @@ def _call_reviewers(pipe: dict, context: dict, instruction: str, phase=None) -> 
         "concurrency": "위 에이전트를 **한 메시지에서 동시에** 호출하라. 순차로 부르며 "
                        "앞선 판정을 다음 리뷰어에게 알려주면 독립성이 깨진다.",
         "resultSchema": RESULT_SCHEMA["_reviewer"],
-        "then": "각 리뷰어의 JSON에 `agent` 키를 붙여 배열로 모아 "
+        "then": "각 리뷰어의 JSON에 **`agent` 키를 붙여** 배열로 모아 "
                 "`sdd.py advance --result '{\"reviews\": [...]}'` 로 넘겨라. "
-                "종합 판정은 스크립트가 낸다 — 직접 평균 내지 마라",
+                "하나씩 따로 넘겨도 된다(누적된다) — 다만 `agent` 는 반드시 붙인다. "
+                "종합 판정은 로스터 전원이 모였을 때 스크립트가 낸다 — 직접 평균 내지 마라",
         "pipeline": pipeline_summary(pipe),
     }
 
@@ -2252,6 +2265,12 @@ def combine_verdicts(reviews) -> dict:
     """리뷰어 판정을 종합한다. **평균 내지 않는다** — 하나라도 changes-requested면
     전체가 changes-requested다. severity high 지적만 자동 재시도를 유발한다."""
     seen, gaps, high, soft, unreadable = [], [], [], [], []
+    # 리뷰어가 한 명뿐이면 출처 접두어는 순수 노이즈다 — 갭을 그대로 넘긴다.
+    tag = len([r for r in reviews if isinstance(r, dict)]) > 1
+
+    def _label(name, text):
+        return f"[{name}] {text}" if tag else str(text)
+
     for r in reviews:
         if not isinstance(r, dict):
             continue
@@ -2262,11 +2281,11 @@ def combine_verdicts(reviews) -> dict:
             continue
         seen.append({"agent": name, "verdict": v})
         if v == "changes-requested":
-            gaps.extend(f"[{name}] {g}" for g in (r.get("gaps") or []))
+            gaps.extend(_label(name, g) for g in (r.get("gaps") or []))
         for f in r.get("findings") or []:
             if not isinstance(f, dict):
                 continue
-            line = f"[{name}] {f.get('issue') or f.get('summary') or ''}".strip()
+            line = _label(name, f.get("issue") or f.get("summary") or "").strip()
             where = f.get("file")
             if where:
                 line += f" ({where}:{f.get('line')})" if f.get("line") else f" ({where})"
@@ -2279,28 +2298,84 @@ def combine_verdicts(reviews) -> dict:
             "highFindings": high, "softFindings": soft, "unreadable": unreadable}
 
 
-def _advance_review(root: Path, pipe: dict, result: dict) -> None:
-    carry = pipe["carry"]
+def pending_reviewers(pipe: dict) -> list:
+    """로스터 중 아직 판정을 내지 않은 리뷰어."""
+    got = {r.get("agent") for r in (pipe.get("carry") or {}).get("reviewResults") or []}
+    return [n for n in stage_roster(pipe, "review") if n not in got]
 
-    # 리뷰어가 여럿이면 {"reviews": [...]} 로 온다. 단일 판정도 계속 받아들인다.
+
+def _normalize_review_input(pipe: dict, result: dict):
+    """받은 결과를 (리뷰어 결과 리스트, 오류사유) 로 정규화한다.
+
+    단일 판정도 받지만 **누구의 것인지 알 수 있을 때만** 받는다. 로스터가 여럿인데
+    이름 없는 판정 하나로 단계를 끝내면, 한 리뷰어가 나머지를 대신 승인해 버린다."""
     reviews = result.get("reviews")
     if isinstance(reviews, list):
-        combined = combine_verdicts(reviews)
-        if combined["unreadable"]:
-            _halt(pipe, "리뷰 판정을 읽을 수 없는 리뷰어가 있다: "
-                        + ", ".join(combined["unreadable"]))
-            return
-        expected = set(stage_roster(pipe, "review"))
-        got = {x["agent"] for x in combined["perReviewer"]}
-        if expected - got:
-            _halt(pipe, "리뷰 결과가 빠진 리뷰어가 있다: " + ", ".join(sorted(expected - got))
-                        + " — 로스터 전원의 판정이 있어야 종합할 수 있다")
-            return
-        carry["reviewVerdicts"] = combined["perReviewer"]
-        _record(pipe, "reviews-combined", verdict=combined["verdict"],
-                reviewers=len(combined["perReviewer"]),
-                high=len(combined["highFindings"]))
-        result = {"verdict": combined["verdict"], "gaps": combined["gaps"]}
+        return reviews, None
+    roster = stage_roster(pipe, "review")
+    if result.get("agent"):
+        return [result], None
+    pending = pending_reviewers(pipe)
+    if len(roster) == 1:
+        return [dict(result, agent=roster[0])], None
+    if len(pending) == 1:
+        return [dict(result, agent=pending[0])], None
+    return None, ("누구의 판정인지 알 수 없다 — 리뷰어가 "
+                  f"{len(roster)}명({', '.join(roster)})이므로 결과에 `agent` 를 붙이거나 "
+                  '`{"reviews": [...]}` 로 함께 넘겨라. 이름 없는 판정 하나로 단계를 '
+                  "끝내면 한 리뷰어가 나머지를 대신 승인하게 된다")
+
+
+def _advance_review(root: Path, pipe: dict, result: dict) -> None:
+    carry = pipe["carry"]
+    roster = stage_roster(pipe, "review")
+
+    incoming, err = _normalize_review_input(pipe, result)
+    if err:
+        _halt(pipe, err)
+        return
+
+    # 리뷰어 결과는 **누적된다.** 한 번에 다 넘겨도 되고 하나씩 넘겨도 된다 —
+    # 하나가 형식을 어겨도 그 리뷰어만 다시 부르면 되고, 라운드 전체를 다시 돌리지 않는다.
+    stored = {r["agent"]: r for r in (carry.get("reviewResults") or []) if r.get("agent")}
+    rejected, unknown = [], []
+    for r in incoming:
+        if not isinstance(r, dict):
+            continue
+        name = r.get("agent")
+        if not name:
+            rejected.append("(이름 없음)")
+            continue
+        if name not in roster:
+            unknown.append(name)
+            continue
+        if str(r.get("verdict") or "").strip().lower() not in (
+                "approved", "changes-requested"):
+            rejected.append(name)
+            continue
+        stored[name] = r
+    carry["reviewResults"] = list(stored.values())
+
+    missing = [n for n in roster if n not in stored]
+    if missing or rejected:
+        _record(pipe, "review-partial", got=sorted(stored), missing=missing,
+                rejected=rejected, unknown=unknown)
+        if not stored and rejected:
+            # 아무것도 받아들이지 못했다 — 같은 요청을 무한 반복하지 않게 센다.
+            pipe["attempts"]["review"] += 1
+            if pipe["attempts"]["review"] > pipe["maxAttempts"]:
+                _halt(pipe, "리뷰 판정을 읽을 수 없는 상태가 "
+                            f"{pipe['attempts']['review']}회 이어졌다: "
+                            + ", ".join(rejected))
+        return
+
+    combined = combine_verdicts(list(stored.values()))
+    carry["reviewVerdicts"] = combined["perReviewer"]
+    carry["reviewResults"] = []
+    _record(pipe, "reviews-combined", verdict=combined["verdict"],
+            reviewers=len(combined["perReviewer"]),
+            high=len(combined["highFindings"]))
+    result = {"verdict": combined["verdict"], "gaps": combined["gaps"]}
 
     verdict = str(result.get("verdict") or "").strip().lower()
 

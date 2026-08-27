@@ -695,7 +695,13 @@ class PipelineTests(unittest.TestCase):
             _write_valid_spec(root, spec_rel)
             _advance(root, {})
             _advance(root, {"testResult": {"passed": 1, "failed": 0}})
-            halted = _advance(root, {"notes": "좋아 보인다"})
+            # 판정을 읽을 수 없으면 그 리뷰어만 다시 부른다 (라운드 전체를 버리지 않는다)
+            again = _advance(root, {"notes": "좋아 보인다"})
+            self.assertEqual(again["next"]["action"], "call-agents")
+            self.assertEqual(again["next"]["roster"], ["spec-reviewer"])
+            # 같은 요청을 무한 반복하지는 않는다 — 상한에 걸리면 멈춘다
+            _advance(root, {"notes": "여전히 판정 없음"})
+            halted = _advance(root, {"notes": "여전히 판정 없음"})
             self.assertEqual(halted["next"]["action"], "halted")
             self.assertIn("리뷰 판정", halted["pipeline"]["haltReason"])
 
@@ -953,8 +959,8 @@ class RosterPipelineTests(unittest.TestCase):
             self.assertTrue(any("code-reviewer" in g
                                 for g in after["next"]["context"]["reviewGaps"]))
 
-    def test_missing_reviewer_result_halts(self):
-        """로스터 전원의 판정이 없으면 종합하지 않고 멈춘다."""
+    def test_partial_reviews_accumulate_and_ask_only_the_missing(self):
+        """일부만 와도 버리지 않는다 — 남은 리뷰어만 다시 부르고, 종합은 전원이 모여야 한다."""
         with tempfile.TemporaryDirectory() as tmp:
             root = _init_project(tmp)
             _run(root, "테스트 기능", depth="deep")
@@ -968,8 +974,37 @@ class RosterPipelineTests(unittest.TestCase):
 
             out = _advance(root, {"reviews": [
                 {"agent": "spec-reviewer", "verdict": "approved"}]})
+            # 종합하지 않고 남은 리뷰어만 다시 부른다
+            self.assertEqual(out["next"]["action"], "call-agents")
+            self.assertEqual(out["next"]["roster"], ["code-reviewer"])
+            self.assertEqual(out["next"]["alreadyReported"], ["spec-reviewer"])
+            self.assertEqual(out["pipeline"]["stage"], "review")
+
+            # 나머지가 오면 그때 종합된다 — 먼저 온 판정도 살아 있다
+            done = _advance(root, {"reviews": [
+                {"agent": "code-reviewer", "verdict": "changes-requested",
+                 "gaps": ["빈 catch"]}]})
+            self.assertEqual(done["next"]["stage"], "implement")
+            self.assertTrue(any("code-reviewer" in g
+                                for g in done["next"]["context"]["reviewGaps"]))
+
+    def test_unnamed_verdict_cannot_stand_in_for_the_roster(self):
+        """리뷰어가 여럿인데 이름 없는 판정 하나로 단계를 끝내면 한 명이 나머지를 승인한다."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(tmp)
+            _run(root, "테스트 기능", depth="deep")
+            _advance(root, {"contextPack": {}})
+            _write_valid_spec(root, _next(root)["context"]["specPath"])
+            _advance(root, {"openQuestions": []})
+            _advance(root, {"verdict": "accepted"})
+            _advance(root, {"tasks": []})
+            _advance(root, {"filesChanged": []})
+            _advance(root, {"testResult": {"passed": 1, "failed": 0}})
+
+            out = _advance(root, {"verdict": "approved"})
             self.assertEqual(out["next"]["action"], "halted")
-            self.assertIn("code-reviewer", out["pipeline"]["haltReason"])
+            self.assertIn("누구의 판정인지", out["pipeline"]["haltReason"])
+            self.assertNotEqual(out["pipeline"]["status"], "done")
 
     def test_light_path_is_unchanged(self):
         """경량 모드는 예전과 같은 3단계 그대로다."""
