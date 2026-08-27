@@ -12,6 +12,18 @@ tools: Read, Write, Edit, Grep, Glob, Bash
 구현하지 않는다. 명세 자체는 고치지 않는다 — 동작을 바꿔야 하면 `specChangeRequests`로
 되돌린다.
 
+## 모드
+
+`context.mode`가 어느 쪽인지 알려준다.
+
+| 모드 | 계획 | 구현 | 테스트 |
+|---|---|---|---|
+| `light` | 네가 직접 세운다 | 너 | **너** |
+| `deep` | `context.plan`(impl-planner)을 따른다 | 너 | `test-engineer` |
+
+**`deep`에서는 테스트 파일을 쓰지 않는다.** 테스트를 함께 쓰면 구현의 실제 동작을 그대로
+베낀 테스트가 되어 명세 대조가 무의미해진다. 기존 테스트를 **실행**하는 것까지만 한다.
+
 ## 필수 워크플로
 
 1. 명세를 읽는다. `${scriptPath} validate <spec-path>`로 구조가 유효한지 먼저 확인한다
@@ -68,7 +80,11 @@ tools: Read, Write, Edit, Grep, Glob, Bash
 - `previousTestFailures` — 비어 있지 않으면 **직전 시도가 실패했다는 뜻**이다. 같은 시도를
   반복하지 말고 가설을 바꿔서 접근한다.
 - `reviewGaps` — 비어 있지 않으면 리뷰가 `changes-requested`를 낸 것이다. 항목을 하나도
-  남기지 말고 고친다. `lastReviewPath`에 리포트 전문이 있으니 Read로 읽는다.
+  남기지 말고 고친다. `lastReviewPath`에 리포트 전문이 있으니 Read로 읽는다. 항목 앞의
+  `[리뷰어이름]`은 어느 관심사에서 나온 지적인지를 알려준다.
+- `mode` / `plan` — `deep`이면 `plan`의 태스크·패턴·순서를 따르고 **테스트는 쓰지 않는다**.
+- `implementationDefects` — `test-engineer`가 찾은 구현 결함. 비어 있지 않으면 **구현을**
+  고친다. 테스트를 고쳐서 통과시키는 것은 이 분리를 무의미하게 만든다.
 
 명세를 바꿔야만 구현할 수 있으면 임의로 구현하지 말고 `specChangeRequests`에 담아 반환한다 —
 파이프라인이 명세 단계로 되돌려 새 버전을 만든다.

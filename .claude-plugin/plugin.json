@@ -1,7 +1,7 @@
 {
   "name": "sdd",
-  "version": "0.4.0",
-  "description": "Spec-Driven Development 실행 하네스: 명세를 소스 오브 트루스로 삼아 Spec Architect·Software Engineer·Review Agent 세 역할을 분리하고, 페이즈 게이트 훅으로 각 역할의 쓰기 범위를 강제한다.",
+  "version": "0.5.0",
+  "description": "Spec-Driven Development 실행 하네스: 명세를 소스 오브 트루스로 삼아 조사·작성·검토·계획·구현·테스트·리뷰를 10개 서브에이전트로 나누고, 파이프라인 상태머신이 다음 행동을, sdd.py depth가 부를 에이전트를 결정하며, 페이즈 게이트 훅이 각 페이즈의 쓰기 범위를 강제한다.",
   "author": {
     "name": "zeromountain",
     "url": "https://github.com/zeromountain"

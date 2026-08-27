@@ -148,12 +148,11 @@ find ~/.claude/plugins/cache ~/spec-driven-dev -maxdepth 5 -type d -path '*sdd*/
 |---|---|---|
 | `skills/spec-driven-dev/SKILL.md` | ✅ | ✅ |
 | `commands/*.md` (`/sdd:*`) | ✅ | ❌ (스킬을 직접 호출) |
-| `agents/*.md` (서브에이전트 3개) | ✅ | ❌ (Codex 플러그인은 서브에이전트 정의를 지원하지 않는다) |
+| `agents/*.md` (서브에이전트 10개) | ✅ | ❌ (Codex 플러그인은 서브에이전트 정의를 지원하지 않는다) |
 | `hooks/hooks.json` (페이즈 게이트) | ✅ (opt-in) | ❌ (Codex 플러그인 매니페스트에 훅 필드가 없다) |
 | `scripts/sdd.py` (CLI) | ✅ | ✅ (스킬이 Bash로 호출) |
 
-Codex에서는 `spec-driven-dev` 스킬 하나가 Spec Architect·Software Engineer·Review Agent
-세 역할을 **하나의 세션 안에서 순서대로 직접 수행**한다 — 별도 서브에이전트로 위임하지
+Codex에서는 `spec-driven-dev` 스킬 하나가 10개 역할을 **하나의 세션 안에서 순서대로 직접 수행**한다 — 별도 서브에이전트로 위임하지
 않는다. 역할 경계(예: "Spec Architect는 src/를 쓰지 않는다")는 스킬 프롬프트로만
 지켜지고, Claude Code처럼 훅이 실제로 차단하지는 않는다. `sdd.py guard`는 두 호스트
 모두에서 동작하므로, Codex에서는 이걸로 사후에 위반 여부를 확인한다.

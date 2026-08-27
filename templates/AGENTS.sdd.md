@@ -5,15 +5,26 @@
 
 ### 역할
 
-세 역할이 있고 각자 쓰기 범위가 제한된다. 하드 게이트(`enforce: true`)가 켜져 있으면
-아래 경계는 훅이 강제한다 — 위반은 프롬프트가 아니라 도구 호출 단계에서 막힌다.
+세 페이즈(spec → implement → review)마다 역할이 나뉘고 각자 쓰기 범위가 제한된다.
+하드 게이트(`enforce: true`)가 켜져 있으면 **페이즈 경계**는 훅이 강제한다.
 
-1. **Spec Architect** — `specs/`에만 쓴다. 비즈니스 규칙·인수 기준을 정의한다.
-   `src/`, `tests/`를 건드리지 않는다.
-2. **Software Engineer** — `specs/`를 먼저 읽고서만 구현한다. 인수 기준 없는 동작을
-   구현하지 않는다. `specs/`를 고치지 않는다(단, `specs/<slug>/tasks.md`는 예외).
-3. **Review Agent** — 코드와 명세를 대조해 인수 기준마다 구현·테스트 여부를 확인하고
-   리포트를 낸다. 승인 전에는 기능이 완료된 것으로 치지 않는다.
+**spec** — Spec Researcher(조사, 쓰기 없음) → Spec Architect(`specs/`에만 쓴다) →
+Spec Auditor(검증 불가능한 AC·모순·누락된 오류 케이스 적발, 쓰기 없음)
+
+**implement** — Implementation Planner(AC 분해·영향 파일 확정, `tasks.md`만) →
+Software Engineer(구현, `src/`) → Test Engineer(AC별 테스트, `tests/`).
+**Test Engineer는 구현 코드를 고치지 않는다** — 실패는 결함 보고이지 수정 대상이 아니다.
+
+**review** (넷 다 쓰기 없음) — Spec Reviewer(명세 준수) · Code Reviewer(가독성·복잡도) ·
+Security Reviewer(입력 검증·인가·시크릿) · Performance Reviewer(N+1·복잡도·경계 없는 로딩).
+**하나라도 `changes-requested`를 내면 기능은 완료가 아니다.** 판정을 평균 내지 않는다.
+
+### 깊이
+
+작은 변경까지 10개 역할을 다 돌리지 않는다. `sdd.py depth`가 인수 기준 개수·검증 경고·
+본문 키워드를 근거로 `light`(역할 3개)와 `deep`(역할 8개 이상)을 정한다. 보안·성능
+리뷰어는 깊이와 무관하게 해당 신호가 잡히면 붙는다 — 한 줄짜리 인증 수정에도 보안 리뷰는
+돈다. `/sdd:run <설명> --deep`, `--light`로 직접 지정할 수 있다.
 
 ### 명세 구조
 
@@ -39,6 +50,6 @@
 
 ### 명령
 
-`/sdd:run` · `/sdd:spec` · `/sdd:implement` · `/sdd:review` · `/sdd:status` · `/sdd:phase`.
+`/sdd:run` · `/sdd:audit` · `/sdd:spec` · `/sdd:implement` · `/sdd:review` · `/sdd:status` · `/sdd:phase`.
 `/sdd:spec`·`/sdd:implement`·`/sdd:review`는 파이프라인을 한 스텝만 진행시키는 수동 경로다.
 자세한 사용법은 `sdd` 플러그인의 `spec-driven-dev` 스킬을 참고한다.

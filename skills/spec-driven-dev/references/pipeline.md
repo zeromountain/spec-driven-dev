@@ -114,3 +114,45 @@
 `advance`는 멱등이 아니다 — 한 번의 서브에이전트 호출에 정확히 한 번 부른다. `--stage`를
 같이 주면 파이프라인의 현재 단계와 어긋난 결과를 거부하므로, 실수로 두 번 넘기는 사고를
 막을 수 있다.
+
+## 단계 안의 역할 순회
+
+한 단계는 이제 에이전트 하나가 아니라 **로스터**다. `sdd.py depth`가 정한 목록을
+`pipeline.roster[stage]`에 담고, `agentIndex`가 그 안의 위치를 가리킨다. `next`는
+`roster`·`rosterPosition`(예: `2/3`)을 함께 돌려주므로 지금 몇 번째인지 알 수 있다.
+
+| 단계 | 깊은 모드 순서 | 되돌아가는 지점 |
+|---|---|---|
+| spec | researcher → architect → auditor | auditor가 `revision-requested` → **architect** (`specAudit` 카운트) |
+| implement | planner → engineer → tester | tester가 결함 보고 → **engineer** (`implement` 카운트) |
+| review | 리뷰어 전원 **동시** | 하나라도 `changes-requested` → implement 단계 |
+
+- 로스터는 **단계에 진입할 때마다 다시 계산된다**(`refresh_roster`). spec에서 light였어도
+  명세가 커졌으면 implement에서 deep이 될 수 있다. `run --depth`로 강제한 값은
+  `forcedDepth`에 남아 파이프라인 내내 유지된다.
+- `_advance_agent`가 같은 단계의 다음 역할로 넘기고, 마지막이었으면 `_enter_stage`가
+  다음 단계로 넘긴다. 그래서 경량 모드(역할 1개)의 전이는 예전과 완전히 같다.
+
+## 리뷰 단계는 `call-agents`다
+
+리뷰만 `action: "call-agent"`가 아니라 `"call-agents"`를 낸다. 리뷰어를 순차로 부르며 앞선
+판정을 넘기면 독립성이 깨지고, 먼저 나온 관심사가 뒤의 것을 덮기 때문이다. 리뷰어가 하나뿐인
+경량 모드에서도 형태는 같다 — 오케스트레이터가 분기할 일이 없게 한다.
+
+```
+advance --result '{"reviews": [{"agent": "spec-reviewer", "verdict": "approved"},
+                               {"agent": "code-reviewer", "verdict": "changes-requested",
+                                "gaps": ["빈 catch"]}]}'
+```
+
+`combine_verdicts`가 종합한다:
+
+- **하나라도 `changes-requested`면 전체가 `changes-requested`다.** 평균 내지 않는다.
+- `gaps`에는 `[리뷰어이름]` 접두어가 붙어 구현자가 출처를 안다.
+- `severity: "high"` 지적만 `gaps`에 합류해 재시도를 유발한다. `medium`/`low`는
+  `softFindings`로 리포트에만 남는다.
+- 로스터 전원의 판정이 오지 않으면 종합하지 않고 `halted`가 된다 — 일부만 보고 승인하는
+  경로를 남기지 않는다.
+- 판정 문자열이 `approved`/`changes-requested`가 아니면 그 리뷰어를 이름으로 지목하며
+  `halted`가 된다.
+

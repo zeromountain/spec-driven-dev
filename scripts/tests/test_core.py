@@ -444,7 +444,8 @@ def _init_project(tmp: str) -> Path:
 def _run(root: Path, feature=None, **kw):
     return sdd.cmd_run(_ns(path=str(root), feature=feature, slug=kw.get("slug"),
                            resume=kw.get("resume", False), restart=kw.get("restart", False),
-                           max_attempts=kw.get("max_attempts", sdd.DEFAULT_MAX_ATTEMPTS)))
+                           max_attempts=kw.get("max_attempts", sdd.DEFAULT_MAX_ATTEMPTS),
+                           depth=kw.get("depth")))
 
 
 def _next(root: Path):
@@ -504,7 +505,8 @@ class PipelineTests(unittest.TestCase):
 
             after_impl = _advance(root, {"testResult": {"passed": 2, "failed": 0}})
             self.assertEqual(after_impl["next"]["stage"], "review")
-            self.assertEqual(after_impl["next"]["agent"], "spec-reviewer")
+            self.assertEqual(after_impl["next"]["action"], "call-agents")
+            self.assertEqual(after_impl["next"]["roster"], ["spec-reviewer"])
 
             after_review = _advance(root, {"verdict": "approved"})
             self.assertEqual(after_review["next"]["action"], "done")
@@ -722,6 +724,254 @@ class PipelineTests(unittest.TestCase):
             self.assertTrue(res["ok"])
             self.assertEqual(res["next"]["action"], "ask-user")
 
+
+
+class DepthTests(unittest.TestCase):
+    """어떤 서브에이전트를 부를지는 모델이 아니라 decide_depth 가 정한다."""
+
+    def test_plain_feature_is_light(self):
+        r = sdd.decide_depth(feature_text="버튼 색상을 파란색으로 바꾼다")
+        self.assertEqual(r["depth"], "light")
+        self.assertEqual(r["agents"]["spec"], ["spec-architect"])
+        self.assertEqual(r["agents"]["implement"], ["software-engineer"])
+        self.assertEqual(r["agents"]["review"], ["spec-reviewer"])
+
+    def test_security_keyword_forces_deep_and_attaches_reviewer(self):
+        r = sdd.decide_depth(feature_text="로그인 토큰 만료 처리")
+        self.assertEqual(r["depth"], "deep")
+        self.assertIn("security-reviewer", r["agents"]["review"])
+        self.assertNotIn("perf-reviewer", r["agents"]["review"])
+
+    def test_numeric_latency_is_a_perf_signal(self):
+        r = sdd.decide_depth(feature_text="업로드 응답은 3초 이내여야 한다")
+        self.assertIn("perf-reviewer", r["agents"]["review"])
+        r2 = sdd.decide_depth(feature_text="3초짜리 애니메이션 추가")
+        self.assertEqual(r2["signals"]["perfHits"], [])
+
+    def test_signal_reviewer_survives_force_light(self):
+        """경량을 강제해도 보안 신호가 있으면 보안 리뷰어는 붙는다."""
+        r = sdd.decide_depth(feature_text="비밀번호 재설정", force="light")
+        self.assertEqual(r["depth"], "light")
+        self.assertEqual(r["agents"]["implement"], ["software-engineer"])
+        self.assertIn("security-reviewer", r["agents"]["review"])
+
+    def test_out_of_scope_keywords_are_not_signals(self):
+        """VALID_SPEC 의 범위 밖은 '인증 기능은 다루지 않는다' — 신호가 아니다."""
+        r = sdd.decide_depth(spec_text=VALID_SPEC)
+        self.assertEqual(r["signals"]["securityHits"], [])
+        self.assertEqual(r["depth"], "light")
+
+    def test_template_boilerplate_is_not_a_signal(self):
+        """빈 명세가 자기 안내문({{성능/보안...}}) 때문에 deep 이 되면 안 된다."""
+        blank = sdd.fill_template("spec.md", {"slug": "x", "version": "1",
+                                              "createdAt": "now", "제목": "테스트"})
+        r = sdd.decide_depth(spec_text=blank)
+        self.assertEqual(r["signals"]["securityHits"], [])
+        self.assertEqual(r["signals"]["perfHits"], [])
+        self.assertEqual(r["depth"], "light")
+
+    def test_many_acs_cross_threshold(self):
+        acs = "\n".join(f"- [ ] **AC-{i}**: 조건 {i}이 충족되면 값을 반환해야 한다."
+                        for i in range(1, 9))
+        spec = VALID_SPEC.replace(
+            "- [ ] **AC-1**: 조건 A가 충족되면 시스템은 X를 반환해야 한다.\n"
+            "- [ ] **AC-2**: 조건 B에서 오류가 발생하면 안 된다.", acs)
+        r = sdd.decide_depth(spec_text=spec)
+        self.assertEqual(r["signals"]["acCount"], 8)
+        self.assertEqual(r["depth"], "deep")
+
+    def test_roster_is_not_shared_between_calls(self):
+        """agents 를 얕게 복사하면 신호 리뷰어가 전역 상수에 누적된다."""
+        sdd.decide_depth(feature_text="로그인 토큰")
+        r = sdd.decide_depth(feature_text="버튼 색상 변경")
+        self.assertEqual(r["agents"]["review"], ["spec-reviewer"])
+        self.assertEqual(sdd.AGENT_ROSTER["deep"]["review"],
+                         ["spec-reviewer", "code-reviewer"])
+
+
+class CombineVerdictsTests(unittest.TestCase):
+    """리뷰어 판정은 평균이 아니라 최악값으로 합쳐진다."""
+
+    def test_one_changes_requested_decides_all(self):
+        c = sdd.combine_verdicts([
+            {"agent": "spec-reviewer", "verdict": "approved"},
+            {"agent": "code-reviewer", "verdict": "approved"},
+            {"agent": "security-reviewer", "verdict": "changes-requested",
+             "gaps": ["소유권 검사가 없다"]},
+        ])
+        self.assertEqual(c["verdict"], "changes-requested")
+        self.assertTrue(any("security-reviewer" in g for g in c["gaps"]))
+
+    def test_all_approved_is_approved(self):
+        c = sdd.combine_verdicts([{"agent": "spec-reviewer", "verdict": "approved"}])
+        self.assertEqual(c["verdict"], "approved")
+
+    def test_only_high_findings_become_gaps(self):
+        c = sdd.combine_verdicts([{
+            "agent": "code-reviewer", "verdict": "approved",
+            "findings": [{"severity": "high", "issue": "빈 catch", "file": "src/a.ts", "line": 9},
+                         {"severity": "low", "issue": "네이밍"}],
+        }])
+        self.assertEqual(len(c["highFindings"]), 1)
+        self.assertIn("src/a.ts:9", c["highFindings"][0])
+        self.assertEqual(len(c["softFindings"]), 1)
+
+    def test_unreadable_verdict_is_reported(self):
+        c = sdd.combine_verdicts([{"agent": "code-reviewer", "verdict": "괜찮음"}])
+        self.assertEqual(c["unreadable"], ["code-reviewer"])
+
+
+class RosterPipelineTests(unittest.TestCase):
+    """깊은 모드에서 파이프라인이 단계 안의 역할을 순서대로 걸어간다."""
+
+    def test_deep_walks_spec_roster_in_order(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(tmp)
+            started = _run(root, "테스트 기능", depth="deep")
+            self.assertEqual(started["depth"]["depth"], "deep")
+            self.assertEqual(_next(root)["agent"], "spec-researcher")
+
+            after = _advance(root, {"contextPack": {"relatedFiles": []}})
+            self.assertEqual(after["next"]["agent"], "spec-architect")
+            self.assertEqual(after["next"]["context"]["contextPack"], {"relatedFiles": []})
+
+            _write_valid_spec(root, _next(root)["context"]["specPath"])
+            after = _advance(root, {"openQuestions": []})
+            self.assertEqual(after["next"]["agent"], "spec-auditor")
+
+            after = _advance(root, {"verdict": "accepted"})
+            self.assertEqual(after["next"]["stage"], "implement")
+            self.assertEqual(after["next"]["agent"], "impl-planner")
+
+    def test_auditor_revision_returns_to_architect(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(tmp)
+            _run(root, "테스트 기능", depth="deep")
+            _advance(root, {"contextPack": {}})
+            _write_valid_spec(root, _next(root)["context"]["specPath"])
+            _advance(root, {"openQuestions": []})            # → auditor
+
+            after = _advance(root, {"verdict": "revision-requested",
+                                    "acFindings": [{"ac": "AC-1", "testable": False}]})
+            self.assertEqual(after["next"]["agent"], "spec-architect")
+            self.assertTrue(after["next"]["context"]["auditFindings"]["acFindings"])
+
+    def test_auditor_loop_halts_at_limit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(tmp)
+            _run(root, "테스트 기능", depth="deep", max_attempts=2)
+            _advance(root, {"contextPack": {}})
+            _write_valid_spec(root, _next(root)["context"]["specPath"])
+            for _ in range(3):
+                _advance(root, {"openQuestions": []})                 # architect
+                out = _advance(root, {"verdict": "revision-requested"})  # auditor
+            self.assertEqual(out["next"]["action"], "halted")
+            self.assertIn("명세 감사", out["pipeline"]["haltReason"])
+
+    def test_deep_implement_splits_engineer_and_tester(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(tmp)
+            _run(root, "테스트 기능", depth="deep")
+            _advance(root, {"contextPack": {}})
+            _write_valid_spec(root, _next(root)["context"]["specPath"])
+            _advance(root, {"openQuestions": []})
+            _advance(root, {"verdict": "accepted"})                    # → impl-planner
+
+            after = _advance(root, {"tasks": [{"id": "T-1"}],
+                                    "testRunner": {"command": "pytest"}})
+            self.assertEqual(after["next"]["agent"], "software-engineer")
+            self.assertEqual(after["next"]["context"]["mode"], "deep")
+            self.assertIn("테스트 파일은 쓰지 마라", after["next"]["instruction"])
+            self.assertEqual(after["next"]["context"]["plan"]["tasks"], [{"id": "T-1"}])
+
+            after = _advance(root, {"filesChanged": ["src/a.py"]})
+            self.assertEqual(after["next"]["agent"], "test-engineer")
+
+            after = _advance(root, {"testResult": {"passed": 2, "failed": 0}})
+            self.assertEqual(after["next"]["stage"], "review")
+
+    def test_test_engineer_failure_returns_to_engineer_not_itself(self):
+        """테스트 작성자가 실패를 내면 테스트를 고치는 게 아니라 구현자에게 돌아간다."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(tmp)
+            _run(root, "테스트 기능", depth="deep")
+            _advance(root, {"contextPack": {}})
+            _write_valid_spec(root, _next(root)["context"]["specPath"])
+            _advance(root, {"openQuestions": []})
+            _advance(root, {"verdict": "accepted"})
+            _advance(root, {"tasks": []})
+            _advance(root, {"filesChanged": ["src/a.py"]})              # → test-engineer
+
+            after = _advance(root, {"testResult": {"passed": 1, "failed": 1},
+                                    "implementationDefects": [{"ac": "AC-2"}]})
+            self.assertEqual(after["next"]["agent"], "software-engineer")
+            self.assertTrue(after["next"]["context"]["implementationDefects"])
+            self.assertIn("테스트를 고쳐서 통과시키지 마라", after["next"]["instruction"])
+
+    def test_reviewers_are_called_together_and_combined(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(tmp)
+            _run(root, "테스트 기능", depth="deep")
+            _advance(root, {"contextPack": {}})
+            _write_valid_spec(root, _next(root)["context"]["specPath"])
+            _advance(root, {"openQuestions": []})
+            _advance(root, {"verdict": "accepted"})
+            _advance(root, {"tasks": []})
+            _advance(root, {"filesChanged": ["src/a.py"]})
+            after = _advance(root, {"testResult": {"passed": 2, "failed": 0}})
+
+            nxt = after["next"]
+            self.assertEqual(nxt["action"], "call-agents")
+            self.assertEqual(nxt["roster"], ["spec-reviewer", "code-reviewer"])
+            self.assertIn("동시에", nxt["concurrency"])
+
+            after = _advance(root, {"reviews": [
+                {"agent": "spec-reviewer", "verdict": "approved"},
+                {"agent": "code-reviewer", "verdict": "changes-requested",
+                 "gaps": ["빈 catch"]},
+            ]})
+            self.assertEqual(after["next"]["stage"], "implement")
+            # 갭은 구현 수준이다 — 계획자를 다시 태우지 않는다
+            self.assertEqual(after["next"]["agent"], "software-engineer")
+            self.assertTrue(any("code-reviewer" in g
+                                for g in after["next"]["context"]["reviewGaps"]))
+
+    def test_missing_reviewer_result_halts(self):
+        """로스터 전원의 판정이 없으면 종합하지 않고 멈춘다."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(tmp)
+            _run(root, "테스트 기능", depth="deep")
+            _advance(root, {"contextPack": {}})
+            _write_valid_spec(root, _next(root)["context"]["specPath"])
+            _advance(root, {"openQuestions": []})
+            _advance(root, {"verdict": "accepted"})
+            _advance(root, {"tasks": []})
+            _advance(root, {"filesChanged": []})
+            _advance(root, {"testResult": {"passed": 1, "failed": 0}})
+
+            out = _advance(root, {"reviews": [
+                {"agent": "spec-reviewer", "verdict": "approved"}]})
+            self.assertEqual(out["next"]["action"], "halted")
+            self.assertIn("code-reviewer", out["pipeline"]["haltReason"])
+
+    def test_light_path_is_unchanged(self):
+        """경량 모드는 예전과 같은 3단계 그대로다."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(tmp)
+            self.assertEqual(_run(root, "테스트 기능")["depth"]["depth"], "light")
+            self.assertEqual(_next(root)["agent"], "spec-architect")
+
+    def test_forced_depth_survives_stage_transitions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(tmp)
+            _run(root, "테스트 기능", depth="deep")
+            _advance(root, {"contextPack": {}})
+            _write_valid_spec(root, _next(root)["context"]["specPath"])
+            _advance(root, {"openQuestions": []})
+            after = _advance(root, {"verdict": "accepted"})
+            # VALID_SPEC 자체는 light 로 판정되지만 --depth deep 이 유지돼야 한다
+            self.assertEqual(after["pipeline"]["depth"], "deep")
+            self.assertEqual(after["next"]["agent"], "impl-planner")
 
 if __name__ == "__main__":
     unittest.main()

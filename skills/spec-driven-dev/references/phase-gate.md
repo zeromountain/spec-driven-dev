@@ -38,6 +38,23 @@ PreToolUse 훅의 stdin 페이로드에는 `session_id`, `cwd`, `tool_name`, `to
 `/sdd:spec`, `/sdd:implement`, `/sdd:review`가 명시적으로 페이즈를 전환하고, 그 순간부터
 다음 전환까지 세션의 모든 쓰기가 그 페이즈 규칙을 받는다.
 
+## 같은 페이즈 안의 역할 분리는 강제되지 않는다
+
+에이전트가 페이즈당 여러 개로 세분화되면서 한 페이즈 안에 **쓰기 권한이 다른 역할이 여럿**
+생겼다. 게이트는 그 차이를 구분하지 못한다 — 위와 같은 이유로 호출자를 모르기 때문이다.
+
+| 경계 | 강제 수단 | 실제로 막히는가 |
+|---|---|---|
+| 페이즈 간 (spec ↔ implement ↔ review) | 훅 | **그렇다** |
+| 읽기 전용 역할 (researcher·auditor·리뷰어 4종) | `tools:` 프론트매터 | **그렇다** — 쓰기 도구가 없다 |
+| implement 안에서 engineer ↔ test-engineer | 프롬프트 | **아니다** |
+| implement 안에서 planner의 `tasks.md` 전용 쓰기 | 프롬프트 (+ `specs/` 게이트) | 부분적 — `specs/` 밖은 안 막힌다 |
+
+깊은 모드에서 `software-engineer`가 `tests/`를 고치거나 `test-engineer`가 `src/`를 고치는
+것은 훅이 통과시킨다. `next`의 `instruction`이 그 금지를 담아 보내고, 두 에이전트의
+`filesChanged`·`testFiles`를 사후 대조해 확인해야 한다. 이 한계를 훅으로 메우려면
+서브에이전트 신원이 PreToolUse 페이로드에 실려야 한다.
+
 ## 경로 정규화
 
 `sdd.to_project_relative()`가 `Path.resolve()`로 심링크와 `..`를 실제 경로로 해석한 뒤

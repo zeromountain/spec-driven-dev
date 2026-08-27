@@ -48,8 +48,50 @@ DEFAULT_STATE = {
     "phase": "off",
     "enforce": False,
     "activeSpec": None,
+    "depth": "light",
     "updatedAt": None,
 }
+
+# 페이즈별 서브에이전트 구성. 경량 경로는 역할당 1명, 깊은 경로는 조사·작성·검토를
+# 분리한다. security/perf 리뷰어는 깊이와 무관하게 신호(키워드)가 잡힐 때만 붙는다.
+AGENT_ROSTER = {
+    "light": {
+        "spec": ["spec-architect"],
+        "implement": ["software-engineer"],
+        "review": ["spec-reviewer"],
+    },
+    "deep": {
+        "spec": ["spec-researcher", "spec-architect", "spec-auditor"],
+        "implement": ["impl-planner", "software-engineer", "test-engineer"],
+        "review": ["spec-reviewer", "code-reviewer"],
+    },
+}
+
+# 리포트에 항상 네 줄이 다 나와야 "실행되지 않음"과 "문제 없음"이 구분된다.
+REVIEWER_CONCERNS = {
+    "spec-reviewer": "명세 준수·AC 커버리지·스펙 밖 구현",
+    "code-reviewer": "가독성·복잡도·중복·에러 처리",
+    "security-reviewer": "입력 검증·인가·시크릿·인젝션",
+    "perf-reviewer": "N+1·복잡도·재계산·경계 없는 로딩",
+}
+
+# "복잡해 보인다"를 모델이 판단하면 매번 달라진다 — 임계값을 여기 고정한다.
+DEPTH_THRESHOLDS = {"acCount": 8, "ecCount": 5, "warningCount": 3}
+
+SECURITY_HINT_RE = re.compile(
+    r"(인증|인가|권한|로그인|회원가입|비밀번호|패스워드|토큰|세션|쿠키|암호화|복호화|"
+    r"해싱|개인정보|주민등록|결제|카드번호|시크릿|비밀키|파일\s*업로드|SQL|XSS|CSRF|"
+    r"auth|oauth|jwt|secret|password|token|credential)",
+    re.IGNORECASE,
+)
+PERF_HINT_RE = re.compile(
+    r"(성능|지연|레이턴시|응답\s*시간|처리량|대용량|대량|배치|동시성|동시\s*접속|병렬|"
+    r"캐시|캐싱|인덱스|페이지네이션|무한\s*스크롤|스트리밍|N\+1|초당|메모리\s*사용|"
+    r"throughput|latency|timeout|타임아웃|"
+    # "응답은 3초 이내" 처럼 수치로 표현된 지연 요구도 성능 신호다.
+    r"\d+\s*(?:초|ms|밀리초|분)\s*(?:이내|이하|안에))",
+    re.IGNORECASE,
+)
 
 # 인수 기준(AC)은 체크박스 항목, 오류 케이스(EC)는 일반 불릿 항목이다.
 AC_LINE_RE = re.compile(r"^-\s*\[[ xX]\]\s*(.*)$")
@@ -452,6 +494,104 @@ def trace_spec(spec_text: str, test_dirs, ac_pattern: str, project_root: Path) -
 
 
 # ---------------------------------------------------------------------------
+# 깊이 판정 (어떤 서브에이전트를 부를지)
+# ---------------------------------------------------------------------------
+
+def depth_haystack(spec_text=None, feature_text=None) -> str:
+    """신호 키워드를 찾을 본문. `범위 밖` 섹션과 미기입 플레이스홀더는 제외한다.
+
+    - "인증 기능은 다루지 않는다"는 보안 신호가 아니라 그 반대다 — 명시적으로 범위에서
+      뺀 단어까지 스캔하면 제외 선언이 리뷰어를 부르는 역설이 생긴다.
+    - 템플릿의 `{{성능/보안/호환성 등...}}` 같은 안내문은 명세의 내용이 아니라 빈칸이다.
+      이걸 세면 갓 생성된 빈 명세가 자기 보일러플레이트 때문에 deep 이 된다."""
+    parts = []
+    if spec_text:
+        sections = parse_sections(spec_text)
+        source = list(sections.items()) if sections else [("", spec_text)]
+        parts.extend(body for name, body in source if name != "범위 밖")
+    if feature_text:
+        parts.append(feature_text)
+    return PLACEHOLDER_RE.sub(" ", "\n".join(parts))
+
+
+def decide_depth(spec_text=None, feature_text=None, force=None) -> dict:
+    """light/deep 과 페이즈별 서브에이전트 구성을 결정한다 (순수 함수).
+
+    명세가 이미 있으면 명세 본문이 근거가 되고, 아직 없으면(spec 단계 진입 시점)
+    기능 설명 문자열만으로 판정한다. 모델이 "이건 복잡해 보인다"로 정하지 않도록
+    임계값·키워드는 전부 이 모듈에 있다."""
+    haystack = depth_haystack(spec_text, feature_text)
+
+    ac_count = ec_count = warning_count = 0
+    if spec_text:
+        v = validate_spec(spec_text)
+        ac_count = len(v["acIds"])
+        ec_count = len(v["ecIds"])
+        warning_count = len(v["warnings"])
+
+    security_hits = sorted({m.group(0) for m in SECURITY_HINT_RE.finditer(haystack)})
+    perf_hits = sorted({m.group(0) for m in PERF_HINT_RE.finditer(haystack)})
+
+    deep_reasons = []
+    if ac_count >= DEPTH_THRESHOLDS["acCount"]:
+        deep_reasons.append(
+            f"인수 기준이 {ac_count}개로 임계값 {DEPTH_THRESHOLDS['acCount']}개 이상이다")
+    if ec_count >= DEPTH_THRESHOLDS["ecCount"]:
+        deep_reasons.append(
+            f"오류 케이스가 {ec_count}개로 임계값 {DEPTH_THRESHOLDS['ecCount']}개 이상이다")
+    if warning_count >= DEPTH_THRESHOLDS["warningCount"]:
+        deep_reasons.append(
+            f"명세 검증 경고가 {warning_count}개로 임계값 "
+            f"{DEPTH_THRESHOLDS['warningCount']}개 이상이다")
+    if security_hits:
+        deep_reasons.append(f"보안 신호가 잡혔다: {', '.join(security_hits[:5])}")
+    if perf_hits:
+        deep_reasons.append(f"성능 신호가 잡혔다: {', '.join(perf_hits[:5])}")
+
+    depth = "deep" if deep_reasons else "light"
+    forced_to = force if force in ("light", "deep") else None
+    if forced_to:
+        depth = forced_to
+
+    roster = {phase: list(names) for phase, names in AGENT_ROSTER[depth].items()}
+    # 신호 기반 리뷰어는 깊이와 무관하다 — 한 줄짜리 인증 수정에도 보안 리뷰는 붙는다.
+    if security_hits:
+        roster["review"].append("security-reviewer")
+    if perf_hits:
+        roster["review"].append("perf-reviewer")
+
+    return {
+        "depth": depth,
+        "forcedTo": forced_to,
+        "signals": {
+            "acCount": ac_count,
+            "ecCount": ec_count,
+            "warningCount": warning_count,
+            "securityHits": security_hits,
+            "perfHits": perf_hits,
+        },
+        "thresholds": dict(DEPTH_THRESHOLDS),
+        "deepReasons": deep_reasons,
+        "agents": roster,
+    }
+
+
+def depth_for_slug(root: Path, slug, feature=None, force=None) -> dict:
+    """대상 명세가 있으면 그 본문으로, 없으면 기능 설명으로 깊이를 정한다."""
+    config = load_config(root)
+    specs_dir = root / config["specsDir"]
+    spec_text = None
+    version = find_latest_version(specs_dir, slug) if slug else 0
+    if version:
+        spec_text = (specs_dir / slug / f"spec-v{version}.md").read_text(encoding="utf-8")
+    result = decide_depth(spec_text, feature, force)
+    result["slug"] = slug
+    result["version"] = version or None
+    result["basedOn"] = "spec" if spec_text else ("feature" if feature else "none")
+    return result
+
+
+# ---------------------------------------------------------------------------
 # 페이즈 게이트 (hooks/phase_gate.py 가 그대로 재사용하는 순수 함수)
 # ---------------------------------------------------------------------------
 
@@ -764,8 +904,8 @@ def cmd_tasks(args) -> dict:
     return ensure_tasks(root, resolve_slug(root, getattr(args, "slug", None)))
 
 
-def build_review_report(root: Path, slug) -> dict:
-    """trace 결과를 반영한 리뷰 리포트 골격을 .sdd/reviews/ 에 만든다."""
+def build_review_report(root: Path, slug, force=None) -> dict:
+    """trace·depth 결과를 반영한 리뷰 리포트 골격을 .sdd/reviews/ 에 만든다."""
     config = load_config(root)
     specs_dir = root / config["specsDir"]
     if not slug:
@@ -797,6 +937,25 @@ def build_review_report(root: Path, slug) -> dict:
     guard_rows = "\n".join(f"- `{x['file']}` — {x['reason'][:80]}" for x in violations) \
         or "- 없음"
 
+    # 어떤 리뷰어가 붙는지는 depth 가 정한다 — 리포트가 그 목록을 미리 담고 있어야
+    # "실행되지 않은 리뷰어"와 "문제를 못 찾은 리뷰어"가 구분된다.
+    depth = decide_depth(text, force=force)
+    reviewers = depth["agents"]["review"]
+    reviewer_rows = "| 리뷰어 | 관심사 | 판정 |\n|---|---|---|\n" + "\n".join(
+        f"| `{name}` | {REVIEWER_CONCERNS.get(name, '—')} | "
+        # 표 셀 안에서는 파이프를 쓸 수 없다 — 셀이 쪼개진다.
+        + ("{{approved 또는 changes-requested}}" if name in reviewers else "실행되지 않음")
+        + " |"
+        for name in REVIEWER_CONCERNS
+    )
+
+    def section_for(name: str, hint: str) -> str:
+        if name in reviewers:
+            return "{{" + name + ": " + hint + "}}"
+        return (f"이번 리뷰에서 `{name}`는 실행되지 않았다 "
+                f"(깊이: {depth['depth']}, 해당 신호 없음). "
+                "이 절의 공백은 '문제 없음'을 뜻하지 않는다.")
+
     reviews_dir = root / config["reviewsDir"]
     reviews_dir.mkdir(parents=True, exist_ok=True)
     seq = len(list(reviews_dir.glob(f"{slug}-v{version}-*.md"))) + 1
@@ -806,25 +965,49 @@ def build_review_report(root: Path, slug) -> dict:
         "version": str(version),
         "seq": str(seq),
         "specPath": str(spec_path.relative_to(root)),
+        "depth": depth["depth"],
+        "reviewerRows": reviewer_rows,
         "acRows": ac_table,
         "ecRows": ec_table,
         "guardRows": guard_rows,
+        "codeReviewSection": section_for("code-reviewer", "가독성·복잡도·중복·에러 처리"),
+        "securityReviewSection": section_for("security-reviewer", "입력 검증·인가·시크릿"),
+        "perfReviewSection": section_for("perf-reviewer", "N+1·복잡도·경계 없는 로딩"),
     }), encoding="utf-8")
 
     return {"created": True, "path": str(out.relative_to(root)), "seq": seq,
             "version": version, "coverage": tr["coverage"],
             "uncovered": tr["uncovered"], "guardViolations": len(violations),
             "specPath": str(spec_path.relative_to(root)),
-            "minCoverage": config.get("minCoverage")}
+            "minCoverage": config.get("minCoverage"),
+            "depth": depth["depth"], "reviewers": reviewers,
+            "signals": depth["signals"]}
 
 
 def cmd_review_report(args) -> dict:
     root = Path(args.path).resolve()
-    return build_review_report(root, resolve_slug(root, getattr(args, "slug", None)))
+    return build_review_report(root, resolve_slug(root, getattr(args, "slug", None)),
+                               force=getattr(args, "force", None))
 
 
-def cmd_list(args) -> dict:
+def cmd_depth(args) -> dict:
+    """이번 작업에 어떤 서브에이전트를 부를지 결정하고 state 에 기록한다."""
     root = Path(args.path).resolve()
+    result = depth_for_slug(root, resolve_slug(root, getattr(args, "slug", None)),
+                            getattr(args, "feature", None), getattr(args, "force", None))
+    state_path = root / ".sdd" / "state.json"
+    if state_path.exists():
+        state = load_state(root)
+        state["depth"] = result["depth"]
+        state["updatedAt"] = now_iso()
+        write_json(state_path, state)
+        result["stateUpdated"] = True
+    else:
+        result["stateUpdated"] = False
+    return result
+
+
+def list_specs(root: Path) -> dict:
     config = load_config(root)
     specs_dir = root / config["specsDir"]
     reviews_dir = root / config["reviewsDir"]
@@ -854,6 +1037,10 @@ def cmd_list(args) -> dict:
     return {"specs": items}
 
 
+def cmd_list(args) -> dict:
+    return list_specs(Path(args.path).resolve())
+
+
 def cmd_status(args) -> dict:
     root = Path(args.path).resolve()
     state = load_state(root)
@@ -867,6 +1054,7 @@ def cmd_status(args) -> dict:
         "phase": phase,
         "enforce": bool(state.get("enforce")),
         "activeSpec": state.get("activeSpec"),
+        "depth": state.get("depth", DEFAULT_STATE["depth"]),
         "specs": listing["specs"],
         "guardViolations": violations,
         "pipeline": pipeline_summary(state.get("pipeline")),
@@ -960,26 +1148,70 @@ PIPELINE_STAGES = ("spec", "implement", "review")
 DEFAULT_MAX_ATTEMPTS = 2
 MAX_PIPELINE_STEPS = 24
 MAX_HISTORY = 40
-AGENT_FOR_STAGE = {
-    "spec": "spec-architect",
-    "implement": "software-engineer",
-    "review": "spec-reviewer",
-}
 # 각 서브에이전트의 출력 JSON을 **그대로** advance에 넘기면 된다. 아래는 그중 전이를
-# 실제로 결정하는 키만 추린 것이고, 나머지 키는 무시된다.
+# 실제로 결정하는 키만 추린 것이고, 나머지 키는 무시된다. 단계가 아니라 **에이전트**로
+# 키를 잡는다 — 같은 단계 안에서도 전이를 결정하는 키가 역할마다 다르기 때문이다.
 RESULT_SCHEMA = {
-    "spec": {
+    "spec-researcher": {
+        "contextPack": "객체 — 다음 단계 spec-architect 프롬프트에 그대로 실린다",
+        "unknowns": "[string] — 코드를 읽어도 답이 안 나온 것 (질문 후보이지 질문 자체는 아니다)",
+    },
+    "spec-architect": {
         "openQuestions": "[string] — 있으면 파이프라인이 멈추고 사용자에게 묻는다 (없으면 빈 배열)",
     },
-    "implement": {
+    "spec-auditor": {
+        "verdict": "accepted | revision-requested — 필수",
+        "acFindings": "[object] — revision-requested 일 때 아키텍트에게 그대로 되돌아간다",
+        "missingErrorCases": "[object] — 같이 되돌아간다",
+    },
+    "impl-planner": {
+        "tasks": "[object] — 구현자·테스트작성자 양쪽 프롬프트에 실린다",
+        "testRunner": "객체 — {command, evidence}",
+        "specChangeRequests": "[string] — 있으면 spec 단계로 되돌아가 새 버전을 만든다",
+    },
+    "software-engineer": {
+        "filesChanged": "[string] — 리뷰어에게 전달된다",
         "testResult": {"passed": "int", "failed": "int", "raw": "string — 실패 시 핵심 출력"},
         "specChangeRequests": "[string] — 있으면 spec 단계로 되돌아가 새 버전을 만든다",
     },
-    "review": {
+    "test-engineer": {
+        "testResult": {"passed": "int", "failed": "int", "raw": "string — 실패 시 핵심 출력"},
+        "implementationDefects": "[object] — 있으면 구현자에게 되돌아간다 (테스트를 고치지 않는다)",
+    },
+    "_reviewer": {
         "verdict": "approved | changes-requested — 필수. 없으면 파이프라인이 멈춘다",
         "gaps": "[string] — changes-requested 일 때 구현자에게 그대로 전달된다",
+        "findings": "[object] — severity high 만 자동 재시도를 유발한다",
     },
 }
+
+
+def result_schema_for(agent: str) -> dict:
+    return RESULT_SCHEMA.get(agent) or RESULT_SCHEMA["_reviewer"]
+
+
+def stage_roster(pipe: dict, stage: str):
+    """이 단계에서 부를 에이전트 목록. 없으면 경량 기본값으로 떨어진다."""
+    roster = (pipe.get("roster") or {}).get(stage)
+    return list(roster) if roster else list(AGENT_ROSTER["light"][stage])
+
+
+def current_agent(pipe: dict):
+    roster = stage_roster(pipe, pipe.get("stage"))
+    idx = pipe.get("agentIndex", 0)
+    return roster[idx] if 0 <= idx < len(roster) else roster[-1]
+
+
+def refresh_roster(root: Path, pipe: dict, force=None) -> dict:
+    """단계에 진입할 때마다 깊이를 다시 판정한다 — spec 단계에서 light 였어도
+    명세가 커졌으면 implement 에서 deep 이 될 수 있다."""
+    d = depth_for_slug(root, pipe.get("slug"), pipe.get("feature"),
+                       force or pipe.get("forcedDepth"))
+    pipe["roster"] = d["agents"]
+    pipe["depth"] = d["depth"]
+    pipe["depthReasons"] = d["deepReasons"]
+    pipe["depthSignals"] = d["signals"]
+    return d
 
 
 def _new_pipeline(feature: str, slug: str, max_attempts: int) -> dict:
@@ -988,7 +1220,12 @@ def _new_pipeline(feature: str, slug: str, max_attempts: int) -> dict:
         "slug": slug,
         "stage": "spec",
         "status": "running",
-        "attempts": {"spec": 0, "specRevision": 0, "implement": 0, "review": 0},
+        "agentIndex": 0,
+        "roster": None,          # 단계 진입 시 refresh_roster 가 채운다
+        "depth": None,
+        "forcedDepth": None,
+        "attempts": {"spec": 0, "specAudit": 0, "specRevision": 0,
+                     "implement": 0, "review": 0},
         "maxAttempts": max_attempts,
         "steps": 0,
         "specPath": None,
@@ -1004,6 +1241,12 @@ def _new_pipeline(feature: str, slug: str, max_attempts: int) -> dict:
             "testFailures": None,
             "reviewGaps": [],
             "implementNotes": None,
+            "contextPack": None,
+            "auditFindings": None,
+            "plan": None,
+            "filesChanged": [],
+            "implementationDefects": [],
+            "reviewVerdicts": [],
         },
         "history": [],
         "haltReason": None,
@@ -1035,13 +1278,29 @@ def _halt(pipe: dict, reason: str) -> None:
     _record(pipe, "halted", reason=reason)
 
 
-def _enter_stage(pipe: dict, stage: str) -> None:
+def _enter_stage(pipe: dict, stage: str, agent_index: int = 0) -> None:
     """단계 진입 시 그 단계에서 한 번만 만들어야 하는 산출물 포인터를 비운다 —
-    `next`를 두 번 불러도 리뷰 리포트가 중복 생성되지 않게 하는 멱등성 장치."""
+    `next`를 두 번 불러도 리뷰 리포트가 중복 생성되지 않게 하는 멱등성 장치.
+
+    로스터 안의 위치(agentIndex)도 함께 되돌린다. 같은 단계로 되돌아오는 재시도는
+    호출부가 agent_index 를 명시해 특정 역할부터 다시 시작시킬 수 있다."""
     pipe["stage"] = stage
+    pipe["agentIndex"] = agent_index
     if stage != "review":
         pipe["reviewPath"] = None
-    _record(pipe, "stage-entered", stage=stage)
+        pipe["carry"]["reviewVerdicts"] = []
+    _record(pipe, "stage-entered", stage=stage, agentIndex=agent_index)
+
+
+def _advance_agent(pipe: dict) -> bool:
+    """같은 단계 안에서 다음 역할로 넘어간다. 마지막이었으면 False."""
+    roster = stage_roster(pipe, pipe["stage"])
+    nxt = pipe.get("agentIndex", 0) + 1
+    if nxt >= len(roster):
+        return False
+    pipe["agentIndex"] = nxt
+    _record(pipe, "agent-advanced", agent=roster[nxt])
+    return True
 
 
 def set_spec_status(spec_path: Path, status: str) -> bool:
@@ -1068,6 +1327,9 @@ def pipeline_summary(pipe) -> dict:
         "slug": pipe.get("slug"),
         "stage": pipe.get("stage"),
         "status": pipe.get("status"),
+        "agent": current_agent(pipe) if pipe.get("stage") in PIPELINE_STAGES else None,
+        "roster": (pipe.get("roster") or {}).get(pipe.get("stage")),
+        "depth": pipe.get("depth"),
         "attempts": pipe.get("attempts"),
         "maxAttempts": pipe.get("maxAttempts"),
         "steps": pipe.get("steps"),
@@ -1117,19 +1379,61 @@ def compute_next(root: Path) -> dict:
 
 
 def _call_agent(pipe: dict, stage: str, context: dict, instruction: str, phase=None) -> dict:
+    agent = current_agent(pipe)
+    roster = stage_roster(pipe, stage)
     return {
         "action": "call-agent",
-        "agent": AGENT_FOR_STAGE[stage],
+        "agent": agent,
         "stage": stage,
+        "roster": roster,
+        "rosterPosition": f"{pipe.get('agentIndex', 0) + 1}/{len(roster)}",
+        "depth": pipe.get("depth"),
         "attempt": pipe["attempts"].get(stage, 0) + 1,
         "maxAttempts": pipe["maxAttempts"],
         "phase": phase,
         "instruction": instruction,
         "context": context,
-        "resultSchema": RESULT_SCHEMA[stage],
+        "resultSchema": result_schema_for(agent),
         "then": "서브에이전트가 반환한 JSON을 **그대로** `sdd.py advance --result '<json>'` 로 "
                 "넘겨라 (모르는 키는 무시된다). 다음 행동은 advance 응답의 next가 알려준다 — "
                 "직접 판단하지 마라",
+        "pipeline": pipeline_summary(pipe),
+    }
+
+
+def _call_reviewers(pipe: dict, context: dict, instruction: str, phase=None) -> dict:
+    """리뷰어는 하나씩이 아니라 **한 번에** 부른다. 순차로 부르며 앞선 판정을 넘기면
+    독립성이 깨지고, 먼저 나온 관심사가 뒤의 것을 덮는다."""
+    roster = stage_roster(pipe, "review")
+    signals = pipe.get("depthSignals") or {}
+    return {
+        "action": "call-agents",
+        "agents": [
+            {
+                "agent": name,
+                "concern": REVIEWER_CONCERNS.get(name, "—"),
+                "context": dict(context, **(
+                    {"securityHits": signals.get("securityHits", [])}
+                    if name == "security-reviewer" else
+                    {"perfHits": signals.get("perfHits", [])}
+                    if name == "perf-reviewer" else {}
+                )),
+            }
+            for name in roster
+        ],
+        "stage": "review",
+        "roster": roster,
+        "depth": pipe.get("depth"),
+        "attempt": pipe["attempts"].get("review", 0) + 1,
+        "maxAttempts": pipe["maxAttempts"],
+        "phase": phase,
+        "instruction": instruction,
+        "concurrency": "위 에이전트를 **한 메시지에서 동시에** 호출하라. 순차로 부르며 "
+                       "앞선 판정을 다음 리뷰어에게 알려주면 독립성이 깨진다.",
+        "resultSchema": RESULT_SCHEMA["_reviewer"],
+        "then": "각 리뷰어의 JSON에 `agent` 키를 붙여 배열로 모아 "
+                "`sdd.py advance --result '{\"reviews\": [...]}'` 로 넘겨라. "
+                "종합 판정은 스크립트가 낸다 — 직접 평균 내지 마라",
         "pipeline": pipeline_summary(pipe),
     }
 
@@ -1138,6 +1442,7 @@ def _next_spec(root: Path, pipe: dict) -> dict:
     config = load_config(root)
     specs_dir = root / config["specsDir"]
     phase = transition_phase(root, "spec", pipe["slug"])
+    refresh_roster(root, pipe)
 
     if not pipe.get("specPath"):
         created = create_spec_file(root, pipe["feature"], pipe["slug"])
@@ -1159,8 +1464,24 @@ def _next_spec(root: Path, pipe: dict) -> dict:
         "reviewGaps": carry.get("reviewGaps") or [],
         "userAnswers": carry.get("userAnswers") or {},
         "acPattern": config["acPattern"],
+        "contextPack": carry.get("contextPack"),
+        "auditFindings": carry.get("auditFindings"),
     }
-    if context["validateErrors"]:
+    agent = current_agent(pipe)
+    if agent == "spec-researcher":
+        context = {"feature": pipe["feature"], "slug": pipe["slug"],
+                   "specsDir": config["specsDir"],
+                   "existingSpecs": list_specs(root)["specs"]}
+        instruction = ("명세를 쓰기 전에 필요한 사실을 모아라. 제안하지 말고 "
+                       "'지금 이렇게 되어 있다'만 적는다. 아무 파일도 쓰지 마라.")
+    elif agent == "spec-auditor":
+        instruction = ("완성된 명세를 적대적으로 읽어라. validate가 통과시킨 구조 뒤의 "
+                       "의미 결함 — 검증 불가능한 AC, 모순, 정상 경로에 대응하는 오류 "
+                       "케이스 누락 — 을 찾는다. 명세를 고치지 마라.")
+    elif context["auditFindings"]:
+        instruction = ("spec-auditor가 revision-requested를 냈다. auditFindings가 지목한 "
+                       "AC/EC만 그 제안대로 고쳐라 — 지목되지 않은 부분은 건드리지 마라.")
+    elif context["validateErrors"]:
         instruction = ("직전 명세가 검증에 실패했다. validateErrors를 전부 해소하도록 "
                        "같은 파일을 고쳐라 (새 버전을 만들지 마라).")
     elif context["specChangeRequests"]:
@@ -1176,6 +1497,7 @@ def _next_spec(root: Path, pipe: dict) -> dict:
 def _next_implement(root: Path, pipe: dict) -> dict:
     config = load_config(root)
     phase = transition_phase(root, "implement", pipe["slug"])
+    refresh_roster(root, pipe)
     if phase["blocked"]:
         _halt(pipe, "implement 페이즈 전환이 차단됐다: " + "; ".join(phase["reasons"]))
         _persist_pipeline(root, pipe)
@@ -1201,13 +1523,34 @@ def _next_implement(root: Path, pipe: dict) -> dict:
         "reviewGaps": carry.get("reviewGaps") or [],
         "lastReviewPath": pipe.get("lastReviewPath"),
         "reviewRound": pipe["attempts"].get("review", 0),
+        "plan": carry.get("plan"),
+        "filesChanged": carry.get("filesChanged") or [],
+        "implementationDefects": carry.get("implementationDefects") or [],
     }
-    if context["reviewGaps"]:
+    agent = current_agent(pipe)
+    roster = stage_roster(pipe, "implement")
+    context["mode"] = "deep" if "test-engineer" in roster else "light"
+
+    if agent == "impl-planner":
+        instruction = ("인수 기준을 작업 단위로 쪼개고 영향 파일·따를 패턴·테스트 러너를 "
+                       "실제 경로 근거와 함께 확정해 tasksPath의 플레이스홀더를 채워라. "
+                       "구현 코드는 한 줄도 쓰지 마라.")
+    elif agent == "test-engineer":
+        instruction = ("인수 기준마다 최소 1개 테스트를 acPattern 태그와 함께 쓰고 실제로 "
+                       "실행하라. **구현 코드를 고치지 마라** — 실패는 "
+                       "implementationDefects로 보고한다.")
+    elif context["implementationDefects"]:
+        instruction = ("test-engineer가 구현 결함을 보고했다. implementationDefects를 보고 "
+                       "구현을 고쳐라 — 테스트를 고쳐서 통과시키지 마라.")
+    elif context["reviewGaps"]:
         instruction = ("리뷰가 changes-requested를 냈다. reviewGaps 항목을 하나도 남기지 말고 "
                        "고쳐라. lastReviewPath에 리뷰 리포트 전문이 있다.")
     elif context["previousTestFailures"]:
         instruction = ("직전 시도의 테스트가 실패했다. previousTestFailures를 보고 **가설을 바꿔서** "
                        "고쳐라 — 같은 시도를 반복하지 마라.")
+    elif context["mode"] == "deep":
+        instruction = ("plan을 따라 명세의 인수 기준을 구현하라. **테스트 파일은 쓰지 마라** — "
+                       "test-engineer가 쓴다. 기존 테스트 실행까지만 한다.")
     else:
         instruction = ("명세의 인수 기준을 구현하고, AC별 최소 1개 테스트를 "
                        "acPattern 태그와 함께 작성한 뒤 실제로 실행하라.")
@@ -1219,9 +1562,10 @@ def _next_implement(root: Path, pipe: dict) -> dict:
 def _next_review(root: Path, pipe: dict) -> dict:
     config = load_config(root)
     phase = transition_phase(root, "review", pipe["slug"])
+    refresh_roster(root, pipe)
 
     if not pipe.get("reviewPath"):
-        rep = build_review_report(root, pipe["slug"])
+        rep = build_review_report(root, pipe["slug"], force=pipe.get("forcedDepth"))
         if not rep.get("created"):
             _halt(pipe, "리뷰 리포트를 만들지 못했다: " + str(rep.get("reason")))
             _persist_pipeline(root, pipe)
@@ -1249,18 +1593,64 @@ def _next_review(root: Path, pipe: dict) -> dict:
         "previousGaps": carry.get("reviewGaps") or [],
         "round": pipe["attempts"].get("review", 0) + 1,
     }
-    instruction = ("reviewPath의 리포트에서 남은 {{...}}를 채우고 판정을 내려라. "
+    context["filesChanged"] = carry.get("filesChanged") or []
+    instruction = ("각자 자기 관심사만으로 reviewPath 리포트의 해당 절을 채우고 판정을 "
+                   "내려라. 관심사가 겹치면 판정에 넣지 말고 handoffs로 넘긴다. "
                    "coverage·uncovered·guardViolations는 이미 측정된 값이니 다시 계산하지 마라.")
     if context["previousGaps"]:
         instruction += " previousGaps가 실제로 해소됐는지 먼저 확인하라."
 
     _persist_pipeline(root, pipe)
-    return _call_agent(pipe, "review", context, instruction, phase)
+    return _call_reviewers(pipe, context, instruction, phase)
 
 
 # --- advance -------------------------------------------------------------
 
 def _advance_spec(root: Path, pipe: dict, result: dict) -> None:
+    carry = pipe["carry"]
+    agent = current_agent(pipe)
+
+    if agent == "spec-researcher":
+        carry["contextPack"] = result.get("contextPack") or result
+        _record(pipe, "context-pack-collected",
+                unknowns=len(result.get("unknowns") or []))
+        _advance_agent(pipe)
+        return
+
+    if agent == "spec-auditor":
+        verdict = str(result.get("verdict") or "").strip().lower()
+        if verdict == "accepted":
+            carry["auditFindings"] = None
+            pipe["attempts"]["specAudit"] = 0
+            _record(pipe, "spec-audited", verdict="accepted")
+            _enter_stage(pipe, "implement")
+            return
+        if verdict == "revision-requested":
+            carry["auditFindings"] = {
+                "acFindings": result.get("acFindings") or [],
+                "contradictions": result.get("contradictions") or [],
+                "missingErrorCases": result.get("missingErrorCases") or [],
+                "undefinedBoundaries": result.get("undefinedBoundaries") or [],
+            }
+            pipe["attempts"]["specAudit"] += 1
+            _record(pipe, "spec-revision-requested",
+                    attempt=pipe["attempts"]["specAudit"])
+            if pipe["attempts"]["specAudit"] > pipe["maxAttempts"]:
+                _halt(pipe, f"명세 감사가 {pipe['attempts']['specAudit']}회 연속 "
+                            "revision-requested를 냈다 — 요구사항을 사용자와 다시 합의해야 한다")
+                return
+            # 아키텍트로 되돌린다 (로스터에서 architect 의 위치로).
+            roster = stage_roster(pipe, "spec")
+            pipe["agentIndex"] = roster.index("spec-architect")
+            return
+        _halt(pipe, f"명세 감사 판정을 읽을 수 없다 (verdict={result.get('verdict')!r}) — "
+                    "accepted 또는 revision-requested 여야 한다")
+        return
+
+    _advance_spec_architect(root, pipe, result)
+
+
+def _advance_spec_architect(root: Path, pipe: dict, result: dict) -> None:
     config = load_config(root)
     carry = pipe["carry"]
 
@@ -1292,11 +1682,30 @@ def _advance_spec(root: Path, pipe: dict, result: dict) -> None:
     carry["reviewGaps"] = []
     pipe["attempts"]["spec"] = 0
     _record(pipe, "spec-valid", acCount=len(v["acIds"]), ecCount=len(v["ecIds"]))
+    # 로스터에 감사자가 있으면 구현으로 넘기기 전에 그쪽을 먼저 태운다.
+    if _advance_agent(pipe):
+        return
     _enter_stage(pipe, "implement")
 
 
 def _advance_implement(root: Path, pipe: dict, result: dict) -> None:
     carry = pipe["carry"]
+    agent = current_agent(pipe)
+
+    if agent == "impl-planner" and not (result.get("specChangeRequests") or []):
+        carry["plan"] = {
+            "tasks": result.get("tasks") or [],
+            "patternsToFollow": result.get("patternsToFollow") or [],
+            "testRunner": result.get("testRunner"),
+            "order": result.get("order") or [],
+        }
+        _record(pipe, "plan-ready", tasks=len(carry["plan"]["tasks"]))
+        _advance_agent(pipe)
+        return
+
+    if agent == "test-engineer":
+        _advance_test_engineer(pipe, result)
+        return
 
     changes = result.get("specChangeRequests") or []
     if changes:
@@ -1331,8 +1740,44 @@ def _advance_implement(root: Path, pipe: dict, result: dict) -> None:
 
     carry["testFailures"] = None
     carry["reviewGaps"] = []
+    carry["implementationDefects"] = []
+    carry["filesChanged"] = result.get("filesChanged") or carry.get("filesChanged") or []
     pipe["attempts"]["implement"] = 0
     _record(pipe, "implement-done", testResult=tr or "보고 없음")
+    # 로스터에 테스트 작성자가 있으면 리뷰로 넘기기 전에 그쪽을 먼저 태운다.
+    if _advance_agent(pipe):
+        return
+    _enter_stage(pipe, "review")
+
+
+def _advance_test_engineer(pipe: dict, result: dict) -> None:
+    """테스트 작성자는 구현을 고치지 않는다 — 실패는 구현자에게 되돌린다."""
+    carry = pipe["carry"]
+    tr = result.get("testResult")
+    carry["testResult"] = tr
+    defects = result.get("implementationDefects") or []
+    failed = _failed_count(tr)
+
+    if defects or failed:
+        carry["implementationDefects"] = defects
+        carry["testFailures"] = tr
+        pipe["attempts"]["implement"] += 1
+        _record(pipe, "tests-failed", failed=failed, defects=len(defects),
+                attempt=pipe["attempts"]["implement"])
+        if pipe["attempts"]["implement"] > pipe["maxAttempts"]:
+            _halt(pipe, f"테스트 실패가 {pipe['attempts']['implement']}회 이어졌다 "
+                        f"(구현 결함 {len(defects)}건) — 사용자 판단이 필요하다")
+            return
+        # 테스트를 고치는 게 아니라 구현자에게 되돌린다.
+        roster = stage_roster(pipe, "implement")
+        _enter_stage(pipe, "implement", roster.index("software-engineer"))
+        return
+
+    carry["testFailures"] = None
+    carry["implementationDefects"] = []
+    carry["reviewGaps"] = []
+    pipe["attempts"]["implement"] = 0
+    _record(pipe, "tests-passed", testResult=tr or "보고 없음")
     _enter_stage(pipe, "review")
 
 
@@ -1348,8 +1793,60 @@ def _failed_count(tr):
     return None
 
 
+def combine_verdicts(reviews) -> dict:
+    """리뷰어 판정을 종합한다. **평균 내지 않는다** — 하나라도 changes-requested면
+    전체가 changes-requested다. severity high 지적만 자동 재시도를 유발한다."""
+    seen, gaps, high, soft, unreadable = [], [], [], [], []
+    for r in reviews:
+        if not isinstance(r, dict):
+            continue
+        name = r.get("agent") or "(이름 없음)"
+        v = str(r.get("verdict") or "").strip().lower()
+        if v not in ("approved", "changes-requested"):
+            unreadable.append(name)
+            continue
+        seen.append({"agent": name, "verdict": v})
+        if v == "changes-requested":
+            gaps.extend(f"[{name}] {g}" for g in (r.get("gaps") or []))
+        for f in r.get("findings") or []:
+            if not isinstance(f, dict):
+                continue
+            line = f"[{name}] {f.get('issue') or f.get('summary') or ''}".strip()
+            where = f.get("file")
+            if where:
+                line += f" ({where}:{f.get('line')})" if f.get("line") else f" ({where})"
+            (high if str(f.get("severity", "")).lower() == "high" else soft).append(line)
+
+    gaps.extend(g for g in high if g not in gaps)
+    verdict = "changes-requested" if any(
+        x["verdict"] == "changes-requested" for x in seen) else "approved"
+    return {"verdict": verdict, "perReviewer": seen, "gaps": gaps,
+            "highFindings": high, "softFindings": soft, "unreadable": unreadable}
+
+
 def _advance_review(root: Path, pipe: dict, result: dict) -> None:
     carry = pipe["carry"]
+
+    # 리뷰어가 여럿이면 {"reviews": [...]} 로 온다. 단일 판정도 계속 받아들인다.
+    reviews = result.get("reviews")
+    if isinstance(reviews, list):
+        combined = combine_verdicts(reviews)
+        if combined["unreadable"]:
+            _halt(pipe, "리뷰 판정을 읽을 수 없는 리뷰어가 있다: "
+                        + ", ".join(combined["unreadable"]))
+            return
+        expected = set(stage_roster(pipe, "review"))
+        got = {x["agent"] for x in combined["perReviewer"]}
+        if expected - got:
+            _halt(pipe, "리뷰 결과가 빠진 리뷰어가 있다: " + ", ".join(sorted(expected - got))
+                        + " — 로스터 전원의 판정이 있어야 종합할 수 있다")
+            return
+        carry["reviewVerdicts"] = combined["perReviewer"]
+        _record(pipe, "reviews-combined", verdict=combined["verdict"],
+                reviewers=len(combined["perReviewer"]),
+                high=len(combined["highFindings"]))
+        result = {"verdict": combined["verdict"], "gaps": combined["gaps"]}
+
     verdict = str(result.get("verdict") or "").strip().lower()
 
     if verdict == "approved":
@@ -1373,7 +1870,9 @@ def _advance_review(root: Path, pipe: dict, result: dict) -> None:
             _halt(pipe, f"리뷰가 {pipe['attempts']['review']}회 연속 changes-requested를 냈다 — "
                         "남은 갭: " + ("; ".join(gaps[:5]) or "리포트 참조"))
             return
-        _enter_stage(pipe, "implement")
+        # 갭은 구현 수준이고 계획은 이미 있다 — 계획자를 다시 태우지 않고 구현자로 간다.
+        roster = stage_roster(pipe, "implement")
+        _enter_stage(pipe, "implement", roster.index("software-engineer"))
         return
 
     _halt(pipe, f"리뷰 판정을 읽을 수 없다 (verdict={result.get('verdict')!r}) — "
@@ -1421,9 +1920,14 @@ def cmd_run(args) -> dict:
 
     slug = slugify(args.slug) if args.slug else slugify(feature)
     pipe = _new_pipeline(feature, slug, args.max_attempts)
-    _record(pipe, "started", feature=feature, slug=slug)
+    pipe["forcedDepth"] = getattr(args, "depth", None)
+    d = refresh_roster(root, pipe)
+    _record(pipe, "started", feature=feature, slug=slug, depth=d["depth"])
     _persist_pipeline(root, pipe)
     return {"ok": True, "started": True, "pipeline": pipeline_summary(pipe),
+            "depth": {"depth": d["depth"], "forcedTo": d["forcedTo"],
+                      "deepReasons": d["deepReasons"], "agents": d["agents"],
+                      "agentCount": sum(len(v) for v in d["agents"].values())},
             "next": compute_next(root)}
 
 
@@ -1538,11 +2042,23 @@ def build_parser() -> argparse.ArgumentParser:
                     help="대상 명세 슬러그 (생략하면 activeSpec)")
     sp.set_defaults(func=cmd_tasks)
 
-    sp = sub.add_parser("review-report", help="리뷰 리포트 골격 생성 (trace 결과 반영)")
+    sp = sub.add_parser("review-report", help="리뷰 리포트 골격 생성 (trace·depth 결과 반영)")
     add_path(sp)
     sp.add_argument("slug", nargs="?", default=None,
                     help="대상 명세 슬러그 (생략하면 activeSpec)")
+    sp.add_argument("--force", default=None, choices=["light", "deep"],
+                    help="리뷰어 구성의 깊이를 덮어쓴다")
     sp.set_defaults(func=cmd_review_report)
+
+    sp = sub.add_parser("depth", help="이번 작업에 부를 서브에이전트 구성 결정 (light/deep)")
+    add_path(sp)
+    sp.add_argument("slug", nargs="?", default=None,
+                    help="대상 명세 슬러그 (생략하면 activeSpec)")
+    sp.add_argument("--feature", default=None,
+                    help="아직 명세가 없을 때 판정 근거로 쓸 기능 설명")
+    sp.add_argument("--force", default=None, choices=["light", "deep"],
+                    help="자동 판정을 덮어쓴다 (--deep/--light 플래그의 실체)")
+    sp.set_defaults(func=cmd_depth)
 
     sp = sub.add_parser("list", help="모든 명세 나열")
     add_path(sp)
@@ -1582,6 +2098,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--restart", action="store_true", help="진행 중인 파이프라인을 버리고 새로 시작한다")
     sp.add_argument("--max-attempts", type=int, default=DEFAULT_MAX_ATTEMPTS,
                     dest="max_attempts", help=f"단계별 재시도 상한 (기본: {DEFAULT_MAX_ATTEMPTS})")
+    sp.add_argument("--depth", default=None, choices=["light", "deep"],
+                    help="자동 깊이 판정을 덮어쓴다 (파이프라인 내내 유지된다)")
     sp.set_defaults(func=cmd_run)
 
     sp = sub.add_parser("next", help="파이프라인의 다음 행동 하나를 지시한다")

@@ -7,9 +7,18 @@ repository.
 
 A standalone Claude Code plugin (also a self-hosted marketplace, following the same layout as
 `zeromountain/auto-dev`). It ships a single plugin, `sdd`, that scaffolds and runs a
-Spec-Driven Development harness in any target project: specs as the source of truth, three
-role-bound subagents (Spec Architect / Software Engineer / Review Agent), and an opt-in
-PreToolUse hook that enforces each role's write boundaries by file path.
+Spec-Driven Development harness in any target project: specs as the source of truth, ten
+role-bound subagents across three phases, a pipeline state machine in `sdd.py` that decides
+the next action, and an opt-in PreToolUse hook that enforces each *phase's* write boundaries
+by file path.
+
+The ten agents, by phase (bold = also runs in light mode):
+
+| phase | agents |
+|---|---|
+| spec | `spec-researcher`, **`spec-architect`**, `spec-auditor` |
+| implement | `impl-planner`, **`software-engineer`**, `test-engineer` |
+| review | **`spec-reviewer`**, `code-reviewer`, `security-reviewer`, `perf-reviewer` |
 
 ## Structure
 
@@ -22,7 +31,7 @@ spec-driven-dev/
 │   └── plugin.json         # name: sdd, skills: "./skills/" — read by Codex CLI
 ├── skills/spec-driven-dev/ # SKILL.md orchestrator + references/ (both hosts)
 ├── commands/                # thin routers into the skill (/sdd:*) — Claude Code only
-├── agents/                  # spec-architect, software-engineer, spec-reviewer — Claude Code only
+├── agents/                  # 10 role-bound subagents (see above) — Claude Code only
 ├── hooks/                   # phase_gate.py + hooks.json (opt-in per project) — Claude Code only
 ├── scripts/                 # sdd.py (stdlib-only CLI) + tests/ (both hosts)
 ├── templates/                # scaffolded artifacts (spec.md, tasks.md, review-report.md, AGENTS.sdd.md)
@@ -65,6 +74,22 @@ Keep the two manifests' `version` fields in lockstep — `scripts/validate.py` e
 - **Everything that crosses a subagent boundary goes through `pipeline.carry`.** Subagents
   can't see each other's context, so review gaps, test failures, validate errors, and user
   answers are carried in state and re-injected by `next` — never re-summarized by the LLM.
+- **Which subagents run is decided by `sdd.py depth`, not by the model.** Thresholds
+  (AC/EC counts, validate warnings) and the security/perf signal keywords live in
+  `decide_depth()`; the pipeline re-derives the roster on every stage entry
+  (`refresh_roster`). Adding an agent means adding it to `AGENT_ROSTER` — never teaching the
+  skill to pick agents on vibes. `depth_haystack()` excludes the spec's `범위 밖` section and
+  unfilled `{{...}}` placeholders: an exclusion clause and the template's own boilerplate are
+  not signals.
+- **Reviewers are called together, never in sequence.** The review stage emits
+  `action: "call-agents"` (even when the roster holds one) and `advance` takes
+  `{"reviews": [...]}`. `combine_verdicts()` takes the worst verdict, never an average, and
+  halts if any roster member's result is missing — there is no path to approving on a subset.
+- **The gate enforces phase boundaries, not intra-phase role separation.** PreToolUse
+  payloads carry no subagent identity, so `software-engineer` writing to `tests/` in deep
+  mode is not blocked. Read-only roles are enforced by having no write tool in their
+  `tools:` frontmatter — that half *is* real. Say so plainly in docs rather than implying
+  the hook covers both.
 - Scaffolded artifacts (`AGENTS.md` section, spec/tasks/review templates, command and skill
   descriptions) are written in Korean for the target audience; this repo's own `AGENTS.md` is
   English.
@@ -109,11 +134,16 @@ echo '{"cwd":"/tmp/x","tool_name":"Write","tool_input":{"file_path":"/tmp/x/src/
 
 - New subcommand → add to `scripts/sdd.py`, add its test cases to
   `scripts/tests/test_core.py`, and document it in
-  `skills/spec-driven-dev/references/spec-format.md` or `phase-gate.md` as appropriate.
+  `skills/spec-driven-dev/references/spec-format.md`, `phase-gate.md`, `pipeline.md`,
+  or `depth.md` as appropriate.
 - New command (`commands/*.md`) → frontmatter is exactly `description` + `argument-hint`, body
   is a thin router into the skill (10–17 lines), matching the existing seven.
 - New agent (`agents/*.md`) → frontmatter is `name` + `description` + `tools`; body ends with
-  `## 출력 스키마` (fenced ```json), `## 공통 규칙`, `## 입력 방식`, `## 출력 방식`.
+  `## 출력 스키마` (fenced ```json), `## 공통 규칙`, `## 입력 방식`, `## 출력 방식`. Also add
+  it to `AGENT_ROSTER` (and `REVIEWER_CONCERNS` if it reviews), give it a `RESULT_SCHEMA`
+  entry, teach `_next_<stage>`/`_advance_<stage>` its instruction and transition, and list it
+  in `SKILL.md`, `references/roles.md`, and `templates/AGENTS.sdd.md` — an agent the roster
+  never names will never be called.
 - Bump `version` in **both** `.claude-plugin/plugin.json` and `.codex-plugin/plugin.json` for
   any change you want an already-installed copy to actually pick up — both hosts' `update`
   commands compare semver, not file content, and `scripts/validate.py` fails the build if the
