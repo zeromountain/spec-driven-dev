@@ -1356,6 +1356,33 @@ class WorktreeTests(unittest.TestCase):
             self.assertIsNone(out["worktree"])
             self.assertFalse((root / ".sdd/worktrees/기능-하나").exists())
 
+    def test_porcelain_first_line_path_is_not_truncated(self):
+        """_git 이 stdout 을 통째로 strip 하면 첫 줄의 선행 공백이 사라져
+        ' M src/a.py' 가 'M src/a.py' 가 되고 [3:] 파싱이 'rc/a.py' 를 낸다."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _git_project(tmp)
+            _run(root, "기능 하나")
+            wt = root / ".sdd/worktrees/기능-하나"
+            # 추적 중인 파일을 고친다 → porcelain 의 첫 줄이 ' M ...' 으로 시작한다
+            (wt / "src" / "app.py").write_text("x = 2\n", encoding="utf-8")
+            st = sdd.worktree_status(root, "기능-하나")
+            self.assertIn("src/app.py", st["changedFiles"])
+            self.assertNotIn("rc/app.py", st["changedFiles"])
+
+    def test_status_sees_violations_inside_worktrees(self):
+        """워크트리를 빼먹으면 위반이 있어도 '없음' 으로 보고하게 된다."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _git_project(tmp, enforce=True)
+            _run(root, "기능 하나")
+            # 파이프라인은 spec 단계인데 워크트리의 src/ 를 고쳤다 → 위반이다
+            (root / ".sdd/worktrees/기능-하나/src/app.py").write_text(
+                "x = 2\n", encoding="utf-8")
+            out = sdd.cmd_status(_ns(path=str(root)))
+            self.assertTrue(out["guardViolations"])
+            v = out["guardViolations"][0]
+            self.assertEqual(v["pipeline"], "기능-하나")
+            self.assertEqual(v["file"], "src/app.py")
+
     def test_non_git_project_falls_back_to_main_tree(self):
         """git 이 아니어도 파이프라인은 돌아야 한다 — 다만 그 사실을 숨기지 않는다."""
         with tempfile.TemporaryDirectory() as tmp:

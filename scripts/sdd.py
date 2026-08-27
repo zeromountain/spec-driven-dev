@@ -1094,10 +1094,23 @@ def cmd_status(args) -> dict:
     state = load_state(root)
     config = load_config(root)
     listing = cmd_list(args)
-    violations = []
     phase = state.get("phase", "off")
-    if state.get("enforce") and phase not in (None, "off"):
-        violations = guard_violations(git_changed_files(root), phase, config)
+    pipes = load_pipelines(state)
+    violations = []
+    if state.get("enforce"):
+        # 본체는 전역 페이즈로, 워크트리는 그 파이프라인의 단계로 본다 — 훅이 판정하는
+        # 방식과 같다. 워크트리를 빼먹으면 위반이 있어도 "없음"으로 보고하게 된다.
+        if phase not in (None, "off"):
+            violations += guard_violations(git_changed_files(root), phase, config)
+        for slug, pipe in sorted(pipes.items()):
+            if not (pipe.get("worktree") or {}).get("rel"):
+                continue
+            stage = pipe.get("stage")
+            if stage not in PIPELINE_STAGES:
+                continue
+            for v in guard_violations(
+                    git_changed_files(pipeline_workdir(root, pipe)), stage, config):
+                violations.append(dict(v, pipeline=slug))
     return {
         "phase": phase,
         "enforce": bool(state.get("enforce")),
@@ -1105,7 +1118,7 @@ def cmd_status(args) -> dict:
         "depth": state.get("depth", DEFAULT_STATE["depth"]),
         "specs": listing["specs"],
         "guardViolations": violations,
-        "pipeline": pipeline_summary(load_pipelines(state).get(
+        "pipeline": pipeline_summary(pipes.get(
             resolve_pipeline_slug(state, allow_active=True) or "")),
         "board": board(root),
     }
@@ -1333,14 +1346,19 @@ def git_ok(root: Path) -> bool:
         return False
 
 
-def _git(root: Path, *args) -> tuple:
-    """(성공여부, stdout, stderr). git 이 없으면 (False, "", 사유)."""
+def _git(root: Path, *args, strip_stdout: bool = True) -> tuple:
+    """(성공여부, stdout, stderr). git 이 없으면 (False, "", 사유).
+
+    `strip_stdout=False` 는 `status --porcelain` 처럼 **줄 앞 공백이 의미를 갖는**
+    출력에 쓴다. 통째로 strip 하면 첫 줄의 선행 공백이 사라져 `[3:]` 파싱이 경로를
+    한 글자씩 잘라먹는다 (' M src/a.py' → 'M src/a.py' → 'rc/a.py')."""
     try:
         out = subprocess.run(["git", "-C", str(root), *args],
                              capture_output=True, text=True, check=False)
     except (FileNotFoundError, OSError) as e:
         return False, "", str(e)
-    return out.returncode == 0, out.stdout.strip(), out.stderr.strip()
+    stdout = out.stdout.strip() if strip_stdout else out.stdout
+    return out.returncode == 0, stdout, out.stderr.strip()
 
 
 def worktree_paths(root: Path, config: dict, slug: str) -> dict:
@@ -1414,7 +1432,7 @@ def worktree_status(root: Path, slug: str, config=None) -> dict:
     target = Path(paths["abs"])
     if not target.exists():
         return {"exists": False, **paths}
-    ok, out, _err = _git(target, "status", "--porcelain")
+    ok, out, _err = _git(target, "status", "--porcelain", strip_stdout=False)
     files = [l[3:].strip().strip('"') for l in out.splitlines() if len(l) > 3] if ok else []
     ahead = _git(target, "rev-list", "--count", f"HEAD...{paths['branch']}")[1] if ok else ""
     return {"exists": True, "dirty": bool(files), "changedFiles": files[:50],
