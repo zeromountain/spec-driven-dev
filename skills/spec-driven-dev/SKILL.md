@@ -56,29 +56,39 @@ find ~/spec-driven-dev ~/.claude/plugins/cache -maxdepth 5 -type d -path '*sdd*/
 ### 1단계: 명세 (spec 모드)
 
 1. `$S/sdd.py phase spec --path <root>`로 전환한다.
-2. `spec-architect` 서브에이전트를 "기능 설명 + 관련 기존 코드 컨텍스트"로 호출한다.
-3. 반환된 `specPath`를 `$S/sdd.py validate <specPath>`로 검증한다. `valid: false`면
-   에러 목록을 서브에이전트에게 다시 넘겨 고치게 한다(최대 2회 재시도, 그래도 안 되면
-   `openQuestions`를 사용자에게 그대로 전달).
-4. `openQuestions`가 있으면 사용자에게 묻는다 — 지어내지 않는다.
+2. **`$S/sdd.py new "<기능 설명>" --path <root>`를 먼저 실행해** 명세 파일을 만든다.
+   반환된 `path`가 아키텍트가 채울 파일이다. `spec-architect`에게는 Bash가 없으므로
+   이 단계는 반드시 오케스트레이터인 네가 한다.
+3. `spec-architect` 서브에이전트를 "기능 설명 + **2단계에서 얻은 파일 경로** + 관련 기존
+   코드 컨텍스트"로 호출한다.
+4. `$S/sdd.py validate <specPath> --path <root>`로 검증한다. 갓 생성된 파일은
+   `{{...}}` 플레이스홀더 때문에 **반드시 실패**하므로, 아키텍트가 전부 채웠는지 확인하는
+   수단이 된다. `valid: false`면 에러 목록을 그대로 서브에이전트에게 넘겨 고치게 한다
+   (최대 2회 재시도, 그래도 안 되면 사용자에게 전달).
+5. `openQuestions`가 있으면 사용자에게 묻는다 — 지어내지 않는다.
 
 ### 2단계: 구현 (implement 모드)
 
 1. `$S/sdd.py phase implement --spec <slug> --path <root>`로 전환한다. `blocked: true`면
-   이유를 그대로 보고하고 멈춘다(보통 명세가 아직 유효하지 않다는 뜻).
-2. `software-engineer` 서브에이전트를 "명세 경로 + 프로젝트 언어/테스트 러너 정보"로
-   호출한다.
-3. 반환된 `testResult`가 실패를 포함하면 재시도시킨다(가설을 바꿔서 — 같은 시도 반복 금지).
-4. `specChangeRequests`가 있으면 1단계로 돌아가 명세를 갱신한다.
+   이유를 그대로 보고하고 멈춘다(보통 명세에 플레이스홀더가 남았거나 구조가 어긋났다는 뜻).
+2. `$S/sdd.py tasks <slug> --path <root>`로 AC 대응표가 채워진 `tasks.md`를 만든다.
+3. `software-engineer` 서브에이전트를 "명세 경로 + tasks.md 경로 + 프로젝트 언어/테스트
+   러너 정보"로 호출한다.
+4. 반환된 `testResult`가 실패를 포함하면 재시도시킨다(가설을 바꿔서 — 같은 시도 반복 금지).
+5. `specChangeRequests`가 있으면 1단계로 돌아가 명세를 갱신한다.
 
 ### 3단계: 리뷰 (review 모드)
 
 1. `$S/sdd.py phase review --spec <slug> --path <root>`로 전환한다.
-2. `$S/sdd.py trace <specPath> --path <root>`와 `$S/sdd.py guard --path <root>`를 먼저
-   실행해 그 결과를 `spec-reviewer`에게 근거로 준다.
-3. 반환된 리포트를 `templates/review-report.md` 구조로 `.sdd/reviews/<slug>-v<N>-<seq>.md`에
-   저장한다(seq는 해당 슬러그·버전의 기존 리포트 개수+1).
-4. `verdict: "changes-requested"`면 2단계로 되돌아간다. `run` 모드에서는 최대 2회까지만
+2. `$S/sdd.py review-report <slug> --path <root>`를 실행한다. `trace`·`guard`를 내부에서
+   돌려 AC/EC 커버리지 표와 게이트 위반이 채워진 리포트 골격을 `.sdd/reviews/`에 만들고,
+   경로·커버리지·미커버 AC를 반환한다.
+3. 그 경로와 반환된 수치를 `spec-reviewer`에게 근거로 주고 호출한다.
+4. 반환된 판정·갭·제안으로 리포트의 남은 `{{...}}`를 채워 저장한다.
+5. `verdict: "approved"`면 명세 프론트매터의 `status`를 `done`으로 갱신한다
+   (review 페이즈에서는 `specs/` 쓰기가 막히므로 `$S/sdd.py phase spec` 으로 잠깐
+   되돌린 뒤 고치고 다시 `review`로 돌아온다).
+6. `verdict: "changes-requested"`면 2단계로 되돌아간다. `run` 모드에서는 최대 2회까지만
    자동 반복하고, 그래도 남으면 사용자에게 갭을 보고하고 멈춘다.
 
 ### 4단계: run (전체 파이프라인)

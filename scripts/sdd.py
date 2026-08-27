@@ -51,9 +51,27 @@ DEFAULT_STATE = {
     "updatedAt": None,
 }
 
+# 인수 기준(AC)은 체크박스 항목, 오류 케이스(EC)는 일반 불릿 항목이다.
 AC_LINE_RE = re.compile(r"^-\s*\[[ xX]\]\s*(.*)$")
-AC_ID_RE = re.compile(r"^\*\*AC-(\d+)\*\*\s*[:\-]?\s*(.*)$")
-CONDITION_HINT_RE = re.compile(r"(해야\s*한다|되어야|이어야\s*한다|한다\.|불가하다|안\s*된다)")
+EC_LINE_RE = re.compile(r"^-\s+(?!\[[ xX]\])(.*)$")
+
+
+def _id_re(prefix: str) -> re.Pattern:
+    return re.compile(rf"^\*\*{prefix}-(\d+)\*\*\s*[:\-]?\s*(.*)$")
+
+
+# "~한다."처럼 서술형이면 무엇이든 통과하던 과거 패턴은 검사로서 의미가 없었다.
+# 조건/의무를 실제로 표현하는 어미만 남긴다.
+CONDITION_HINT_RE = re.compile(
+    r"(해야\s*한다|되어야|이어야\s*한다|하면|경우에는|불가하다|안\s*된다|없어야|있어야)"
+)
+# 아키텍트 프롬프트가 금지하는 모호 표현. 검사기가 같은 규칙을 뒷받침한다.
+VAGUE_RE = re.compile(
+    r"(빠르게|적절히|적당히|안전하게|잘\s|효율적으로|사용자\s*친화적|등등|필요시|알아서)"
+)
+PLACEHOLDER_RE = re.compile(r"\{\{[^{}\n]{1,120}\}\}")
+FENCE_RE = re.compile(r"^(\s*)(```|~~~)")
+SPEC_FILENAME_RE = re.compile(r"^spec-v(\d+)\.md$")
 
 SPECS_README = """# specs/
 
@@ -61,11 +79,12 @@ SPECS_README = """# specs/
 `specs/<slug>/spec-v<N>.md`로 버전 관리되며, `sdd` 플러그인의 `spec-architect`
 서브에이전트만 이 디렉터리에 쓴다.
 
-- 명세는 8개 섹션(목적·배경·비즈니스 규칙·기능 요구사항·비기능 요구사항·인수 기준·
-  오류 케이스·범위 밖)을 모두 포함해야 한다.
-- 인수 기준은 `AC-1`, `AC-2`, ... 형식의 ID를 가지며 1부터 연속으로 매긴다.
+- 명세는 8개 섹션을 모두 포함하고, 인수 기준은 `AC-1`부터, 오류 케이스는 `EC-1`부터
+  연속된 ID를 갖는다.
 - 동작이 바뀌면 새 버전(`spec-v<N+1>.md`)을 만든다. 오탈자·명확화는 제자리에서 고친다.
-- `specs/<slug>/tasks.md`는 Software Engineer가 관리하는 작업 체크리스트다.
+
+전체 규칙(섹션 정의·ID 형식·검증 에러 목록·버저닝)은 `sdd` 플러그인의
+`skills/spec-driven-dev/references/spec-format.md`가 정본이다.
 """
 
 
@@ -102,6 +121,22 @@ def load_state(root: Path) -> dict:
     return state if state else dict(DEFAULT_STATE)
 
 
+def fill_template(name: str, values: dict) -> str:
+    """templates/<name>의 `{{key}}`만 치환한다. 채우지 않은 키는 그대로 남아
+    validate가 미기입으로 잡아낸다."""
+    text = (TEMPLATES_DIR / name).read_text(encoding="utf-8")
+    for key, value in values.items():
+        text = text.replace("{{" + key + "}}", value)
+    return text
+
+
+def resolve_slug(root: Path, explicit):
+    """명시 슬러그 → state.activeSpec 순으로 대상 명세를 정한다."""
+    if explicit:
+        return explicit
+    return load_state(root).get("activeSpec")
+
+
 def slugify(text: str) -> str:
     text = unicodedata.normalize("NFC", text).strip().lower()
     text = re.sub(r"[\s_]+", "-", text)
@@ -136,7 +171,57 @@ def to_project_relative(file_path: str, project_root: Path):
 # 명세 파싱 / 검증
 # ---------------------------------------------------------------------------
 
+def strip_code_fences(text: str) -> str:
+    """펜스 코드 블록의 내용을 빈 줄로 치환한다 (줄 수는 보존).
+
+    명세가 마크다운 형식 자체를 예시로 담을 수 있으므로, 펜스 안의 `## `나
+    `{{...}}`를 실제 섹션·플레이스홀더로 오인하면 안 된다."""
+    out = []
+    fence = None  # 열려 있는 펜스 마커
+    for line in text.splitlines():
+        m = FENCE_RE.match(line)
+        if fence is None:
+            if m:
+                fence = m.group(2)
+                out.append("")
+                continue
+            out.append(line)
+        else:
+            out.append("")
+            if m and m.group(2) == fence:
+                fence = None
+    return "\n".join(out)
+
+
+def parse_frontmatter(text: str):
+    """(fields, error). `---` 블록이 없으면 (None, 사유)."""
+    if not text.startswith("---\n"):
+        return None, "명세는 '---' YAML 프론트매터로 시작해야 한다"
+    end = text.find("\n---", 4)
+    if end == -1:
+        return None, "프론트매터가 닫히지 않았다 (닫는 '---' 없음)"
+    fields = {}
+    for line in text[4:end].splitlines():
+        if not line.strip() or line.strip().startswith("#") or ":" not in line:
+            continue
+        key, _, value = line.partition(":")
+        fields[key.strip()] = value.strip()
+    return fields, None
+
+
+def find_duplicate_sections(text: str):
+    header_re = re.compile(r"^##\s+(.+?)\s*$", re.MULTILINE)
+    seen, dups = set(), []
+    for m in header_re.finditer(strip_code_fences(text)):
+        name = m.group(1).strip()
+        if name in seen and name not in dups:
+            dups.append(name)
+        seen.add(name)
+    return dups
+
+
 def parse_sections(text: str) -> dict:
+    text = strip_code_fences(text)
     header_re = re.compile(r"^##\s+(.+?)\s*$", re.MULTILINE)
     matches = list(header_re.finditer(text))
     sections = {}
@@ -148,15 +233,17 @@ def parse_sections(text: str) -> dict:
     return sections
 
 
-def extract_ac_items(ac_section_text: str):
-    """(acId:int, sentence:str, malformed:bool) 리스트. malformed=True면 ID 파싱 실패."""
+def extract_id_items(section_text: str, prefix: str):
+    """(id:int|None, sentence:str, malformed:bool) 리스트. malformed면 ID 파싱 실패."""
+    line_re = AC_LINE_RE if prefix == "AC" else EC_LINE_RE
+    id_re = _id_re(prefix)
     items = []
-    for line in ac_section_text.splitlines():
-        m = AC_LINE_RE.match(line.strip())
+    for line in section_text.splitlines():
+        m = line_re.match(line.strip())
         if not m:
             continue
         content = m.group(1).strip()
-        id_m = AC_ID_RE.match(content)
+        id_m = id_re.match(content)
         if not id_m:
             items.append((None, content, True))
             continue
@@ -164,43 +251,130 @@ def extract_ac_items(ac_section_text: str):
     return items
 
 
-def validate_spec(text: str) -> dict:
-    errors = []
-    warnings = []
+def extract_ac_items(ac_section_text: str):
+    """하위호환 별칭 — 인수 기준 전용."""
+    return extract_id_items(ac_section_text, "AC")
+
+
+def _validate_id_section(section_text: str, prefix: str, section_name: str,
+                         errors: list, warnings: list, check_quality: bool):
+    """AC/EC 공통 검증. 수집된 ID 문자열 리스트를 반환한다."""
+    items = extract_id_items(section_text, prefix)
+    if not items:
+        errors.append({"section": section_name,
+                       "message": f"{prefix} 항목이 하나도 없다"})
+        return []
+
+    ids, nums = [], []
+    for num, sentence, malformed in items:
+        if malformed:
+            errors.append({
+                "section": section_name,
+                "message": f"{prefix} ID가 없는 항목: '{sentence[:40]}'",
+            })
+            continue
+        nums.append(num)
+        ids.append(f"{prefix}-{num}")
+        if not sentence:
+            errors.append({"section": section_name,
+                           "message": f"{prefix}-{num}에 내용이 없다"})
+        elif check_quality:
+            if not CONDITION_HINT_RE.search(sentence):
+                warnings.append({
+                    "section": section_name,
+                    "message": f"{prefix}-{num} 문장에 검증 가능한 조건 표현이 없다: "
+                               f"'{sentence[:40]}'",
+                })
+            if VAGUE_RE.search(sentence):
+                warnings.append({
+                    "section": section_name,
+                    "message": f"{prefix}-{num} 문장이 모호하다 — 숫자·조건으로 "
+                               f"구체화하라: '{sentence[:40]}'",
+                })
+
+    if nums:
+        if len(set(nums)) != len(nums):
+            errors.append({"section": section_name,
+                           "message": f"{prefix} 번호가 중복된다"})
+        if sorted(set(nums)) != list(range(1, max(nums) + 1)):
+            errors.append({"section": section_name,
+                           "message": f"{prefix} 번호가 1부터 연속되지 않는다"})
+    return ids
+
+
+def _validate_frontmatter(text: str, path, errors: list):
+    fields, err = parse_frontmatter(text)
+    if err:
+        errors.append({"section": "frontmatter", "message": err})
+        return
+    for key in ("feature", "version", "status"):
+        if key not in fields:
+            errors.append({"section": "frontmatter",
+                           "message": f"프론트매터에 '{key}'가 없다"})
+    if path is None:
+        return
+
+    p = Path(path)
+    m = SPEC_FILENAME_RE.match(p.name)
+    if m and "version" in fields:
+        if fields["version"] != m.group(1):
+            errors.append({
+                "section": "frontmatter",
+                "message": f"프론트매터 version={fields['version']} 이 파일명 "
+                           f"{p.name}(v{m.group(1)})과 다르다",
+            })
+    if "feature" in fields and p.parent.name:
+        expected = unicodedata.normalize("NFC", p.parent.name)
+        actual = unicodedata.normalize("NFC", fields["feature"])
+        if actual != expected:
+            errors.append({
+                "section": "frontmatter",
+                "message": f"프론트매터 feature='{fields['feature']}' 가 디렉터리 "
+                           f"'{p.parent.name}' 과 다르다",
+            })
+
+
+def validate_spec(text: str, path=None) -> dict:
+    """명세 구조를 검증한다.
+
+    path가 주어지면 프론트매터의 version·feature를 파일명·디렉터리와 교차 검증한다."""
+    errors: list = []
+    warnings: list = []
+
+    _validate_frontmatter(text, path, errors)
+
+    body = strip_code_fences(text)
     sections = parse_sections(text)
 
     for name in REQUIRED_SECTIONS:
         if name not in sections:
             errors.append({"section": name, "message": f"필수 섹션 '## {name}'이 없다"})
 
-    ac_ids = []
-    if "인수 기준" in sections:
-        items = extract_ac_items(sections["인수 기준"])
-        if not items:
-            errors.append({"section": "인수 기준", "message": "AC 항목이 하나도 없다"})
-        nums = []
-        for num, sentence, malformed in items:
-            if malformed:
-                errors.append({
-                    "section": "인수 기준",
-                    "message": f"AC ID가 없는 항목: '{sentence[:40]}'",
-                })
-                continue
-            nums.append(num)
-            ac_ids.append(f"AC-{num}")
-            if not sentence:
-                errors.append({"section": "인수 기준", "message": f"AC-{num}에 내용이 없다"})
-            elif not CONDITION_HINT_RE.search(sentence):
-                warnings.append({
-                    "section": "인수 기준",
-                    "message": f"AC-{num} 문장에 검증 가능한 조건 표현이 약하다: '{sentence[:40]}'",
-                })
-        if nums:
-            if len(set(nums)) != len(nums):
-                errors.append({"section": "인수 기준", "message": "AC 번호가 중복된다"})
-            expected = list(range(1, max(nums) + 1))
-            if sorted(set(nums)) != expected:
-                errors.append({"section": "인수 기준", "message": "AC 번호가 1부터 연속되지 않는다"})
+    for dup in find_duplicate_sections(text):
+        errors.append({"section": dup,
+                       "message": f"'## {dup}' 섹션이 두 번 이상 나온다 — 뒤의 것이 "
+                                  "앞의 것을 덮어써 조용히 누락된다"})
+
+    # 미기입 템플릿을 구현 단계로 넘기지 않기 위한 핵심 검사.
+    placeholders = sorted({m.group(0) for m in PLACEHOLDER_RE.finditer(body)})
+    if placeholders:
+        where = [n for n, t in sections.items() if PLACEHOLDER_RE.search(t)]
+        errors.append({
+            "section": ", ".join(where) if where else "문서 전체",
+            "message": f"채워지지 않은 템플릿 플레이스홀더가 {len(placeholders)}개 남아 "
+                       f"있다: {', '.join(placeholders[:5])}"
+                       + (" …" if len(placeholders) > 5 else ""),
+        })
+
+    ac_ids = _validate_id_section(
+        sections.get("인수 기준", ""), "AC", "인수 기준",
+        errors, warnings, check_quality=True,
+    ) if "인수 기준" in sections else []
+
+    ec_ids = _validate_id_section(
+        sections.get("오류 케이스", ""), "EC", "오류 케이스",
+        errors, warnings, check_quality=False,
+    ) if "오류 케이스" in sections else []
 
     if "범위 밖" in sections and not sections["범위 밖"].strip():
         warnings.append({"section": "범위 밖", "message": "범위 밖 섹션이 비어 있다"})
@@ -210,6 +384,7 @@ def validate_spec(text: str) -> dict:
         "errors": errors,
         "warnings": warnings,
         "acIds": ac_ids,
+        "ecIds": ec_ids,
     }
 
 
@@ -217,11 +392,8 @@ def extract_ac_ids(text: str):
     sections = parse_sections(text)
     if "인수 기준" not in sections:
         return []
-    ids = []
-    for num, _sentence, malformed in extract_ac_items(sections["인수 기준"]):
-        if not malformed:
-            ids.append(f"AC-{num}")
-    return ids
+    return [f"AC-{num}" for num, _s, bad
+            in extract_id_items(sections["인수 기준"], "AC") if not bad]
 
 
 # ---------------------------------------------------------------------------
@@ -509,23 +681,111 @@ def cmd_new(args) -> dict:
     root = Path(args.path).resolve()
     config = load_config(root)
     specs_dir = root / config["specsDir"]
-    slug = slugify(args.feature)
+    slug = slugify(args.slug) if getattr(args, "slug", None) else slugify(args.feature)
     version = find_latest_version(specs_dir, slug) + 1
     feature_dir = specs_dir / slug
     feature_dir.mkdir(parents=True, exist_ok=True)
     spec_path = feature_dir / f"spec-v{version}.md"
 
-    template = (TEMPLATES_DIR / "spec.md").read_text(encoding="utf-8")
-    content = (
-        template
-        .replace("<slug>", slug)
-        .replace("<기능 이름>", args.feature)
-        .replace("<ISO8601>", now_iso())
-        .replace("version: 1", f"version: {version}")
-    )
+    # 문서 전체 substring 치환은 본문을 오염시킬 수 있으므로 채울 키만 명시적으로 넘긴다.
+    content = fill_template("spec.md", {
+        "slug": slug,
+        "version": str(version),
+        "createdAt": now_iso(),
+        "제목": args.feature,
+    })
     spec_path.write_text(content, encoding="utf-8")
 
-    return {"path": str(spec_path.relative_to(root)), "version": version, "slug": slug}
+    return {
+        "path": str(spec_path.relative_to(root)),
+        "version": version,
+        "slug": slug,
+        "note": "플레이스홀더를 모두 채우기 전에는 validate가 실패한다 (의도된 동작).",
+    }
+
+
+def cmd_tasks(args) -> dict:
+    """최신 명세의 AC를 읽어 tasks.md를 생성한다 (AC 대응표가 미리 채워진 상태로)."""
+    root = Path(args.path).resolve()
+    config = load_config(root)
+    specs_dir = root / config["specsDir"]
+    slug = resolve_slug(root, getattr(args, "slug", None))
+    if not slug:
+        return {"created": False, "reason": "대상 명세가 지정되지 않았다"}
+
+    version = find_latest_version(specs_dir, slug)
+    if version == 0:
+        return {"created": False, "reason": f"spec '{slug}' 를 찾을 수 없다"}
+
+    spec_path = specs_dir / slug / f"spec-v{version}.md"
+    ac_ids = extract_ac_ids(spec_path.read_text(encoding="utf-8"))
+    tasks_path = specs_dir / slug / "tasks.md"
+    if tasks_path.exists():
+        return {"created": False, "reason": "이미 존재한다",
+                "path": str(tasks_path.relative_to(root)), "acIds": ac_ids}
+
+    rows = "\n".join(f"- [ ] {ac} → {{{{구현할 파일/모듈}}}}" for ac in ac_ids) \
+        or "- [ ] {{인수 기준이 없다 — 명세를 먼저 확인하라}}"
+    tasks_path.write_text(
+        fill_template("tasks.md", {"slug": slug, "version": str(version), "acRows": rows}),
+        encoding="utf-8",
+    )
+    return {"created": True, "path": str(tasks_path.relative_to(root)),
+            "acIds": ac_ids, "version": version}
+
+
+def cmd_review_report(args) -> dict:
+    """trace 결과를 반영한 리뷰 리포트 골격을 .sdd/reviews/ 에 만든다."""
+    root = Path(args.path).resolve()
+    config = load_config(root)
+    specs_dir = root / config["specsDir"]
+    slug = resolve_slug(root, getattr(args, "slug", None))
+    if not slug:
+        return {"created": False, "reason": "대상 명세가 지정되지 않았다"}
+
+    version = find_latest_version(specs_dir, slug)
+    if version == 0:
+        return {"created": False, "reason": f"spec '{slug}' 를 찾을 수 없다"}
+
+    spec_path = specs_dir / slug / f"spec-v{version}.md"
+    text = spec_path.read_text(encoding="utf-8")
+    v = validate_spec(text, path=spec_path)
+    tr = trace_spec(text, config["testDirs"], config["acPattern"], root)
+    covered = {m["ac"]: m for m in tr["matrix"]}
+
+    ac_rows = "\n".join(
+        f"| {ac} | {{{{✅/❌}}}} | {'✅' if covered.get(ac, {}).get('covered') else '❌'} | "
+        f"{', '.join(covered.get(ac, {}).get('tests', [])) or '—'} |"
+        for ac in v["acIds"]
+    ) or "| — | — | — | 인수 기준 없음 |"
+    ac_table = "| AC | 구현됨 | 테스트됨 | 근거 |\n|---|---|---|---|\n" + ac_rows
+
+    ec_rows = "\n".join(f"| {ec} | {{{{✅/❌}}}} | {{{{비고}}}} |" for ec in v["ecIds"]) \
+        or "| — | — | 오류 케이스 없음 |"
+    ec_table = "| EC | 처리됨 | 비고 |\n|---|---|---|\n" + ec_rows
+
+    state = load_state(root)
+    violations = guard_violations(git_changed_files(root), state.get("phase", "off"), config)
+    guard_rows = "\n".join(f"- `{x['file']}` — {x['reason'][:80]}" for x in violations) \
+        or "- 없음"
+
+    reviews_dir = root / config["reviewsDir"]
+    reviews_dir.mkdir(parents=True, exist_ok=True)
+    seq = len(list(reviews_dir.glob(f"{slug}-v{version}-*.md"))) + 1
+    out = reviews_dir / f"{slug}-v{version}-{seq}.md"
+    out.write_text(fill_template("review-report.md", {
+        "slug": slug,
+        "version": str(version),
+        "seq": str(seq),
+        "specPath": str(spec_path.relative_to(root)),
+        "acRows": ac_table,
+        "ecRows": ec_table,
+        "guardRows": guard_rows,
+    }), encoding="utf-8")
+
+    return {"created": True, "path": str(out.relative_to(root)), "seq": seq,
+            "version": version, "coverage": tr["coverage"],
+            "uncovered": tr["uncovered"], "guardViolations": len(violations)}
 
 
 def cmd_list(args) -> dict:
@@ -541,14 +801,17 @@ def cmd_list(args) -> dict:
             if latest == 0:
                 continue
             spec_path = feature_dir / f"spec-v{latest}.md"
-            v = validate_spec(spec_path.read_text(encoding="utf-8"))
+            v = validate_spec(spec_path.read_text(encoding="utf-8"), path=spec_path)
+            fm, _ = parse_frontmatter(spec_path.read_text(encoding="utf-8"))
             reviews = sorted(reviews_dir.glob(f"{slug}-v{latest}-*.md")) if reviews_dir.exists() else []
             items.append({
                 "slug": slug,
                 "version": latest,
                 "path": str(spec_path.relative_to(root)),
+                "status": (fm or {}).get("status", "unknown"),
                 "valid": v["valid"],
                 "acCount": len(v["acIds"]),
+                "ecCount": len(v["ecIds"]),
                 "errorCount": len(v["errors"]),
                 "warningCount": len(v["warnings"]),
                 "reviewCount": len(reviews),
@@ -582,34 +845,46 @@ def cmd_phase(args) -> dict:
     blocked = False
     reasons = []
 
-    if target == "implement" and args.spec:
-        config = load_config(root)
-        specs_dir = root / config["specsDir"]
-        latest = find_latest_version(specs_dir, args.spec)
-        if latest == 0:
+    # implement 전환은 항상 유효한 명세를 요구한다. --spec 이 없으면 activeSpec 으로
+    # 폴백하고, 그마저 없으면 차단한다 — 검증을 통째로 건너뛰는 경로를 남기지 않는다.
+    target_slug = resolve_slug(root, args.spec)
+    if target == "implement":
+        if not target_slug:
             blocked = True
-            reasons.append(f"spec '{args.spec}' 를 찾을 수 없다")
+            reasons.append(
+                "대상 명세가 지정되지 않았다 — --spec 을 주거나 먼저 /sdd:spec 으로 "
+                "명세를 만들어 activeSpec 을 설정하라"
+            )
         else:
-            spec_path = specs_dir / args.spec / f"spec-v{latest}.md"
-            v = validate_spec(spec_path.read_text(encoding="utf-8"))
-            if not v["valid"]:
+            config = load_config(root)
+            specs_dir = root / config["specsDir"]
+            latest = find_latest_version(specs_dir, target_slug)
+            if latest == 0:
                 blocked = True
-                reasons.append("spec 검증 실패: " + "; ".join(e["message"] for e in v["errors"]))
+                reasons.append(f"spec '{target_slug}' 를 찾을 수 없다")
+            else:
+                spec_path = specs_dir / target_slug / f"spec-v{latest}.md"
+                v = validate_spec(spec_path.read_text(encoding="utf-8"), path=spec_path)
+                if not v["valid"]:
+                    blocked = True
+                    reasons.append("spec 검증 실패: "
+                                   + "; ".join(e["message"] for e in v["errors"]))
 
     if not blocked:
         state["phase"] = target
         state.setdefault("enforce", False)
-        if args.spec:
-            state["activeSpec"] = args.spec
+        if target_slug:
+            state["activeSpec"] = target_slug
         state["updatedAt"] = now_iso()
         write_json(root / ".sdd" / "state.json", state)
 
-    return {"from": from_phase, "to": target, "blocked": blocked, "reasons": reasons}
+    return {"from": from_phase, "to": target, "blocked": blocked,
+            "reasons": reasons, "activeSpec": target_slug}
 
 
 def cmd_validate(args) -> dict:
-    text = Path(args.spec_path).read_text(encoding="utf-8")
-    return validate_spec(text)
+    spec_path = Path(args.spec_path)
+    return validate_spec(spec_path.read_text(encoding="utf-8"), path=spec_path)
 
 
 def cmd_trace(args) -> dict:
@@ -654,7 +929,21 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("new", help="새 기능 명세 생성")
     add_path(sp)
     sp.add_argument("feature", help="기능 설명 (슬러그로 정규화됨)")
+    sp.add_argument("--slug", default=None,
+                    help="슬러그를 직접 지정한다 (예: ASCII 슬러그를 쓰고 싶을 때)")
     sp.set_defaults(func=cmd_new)
+
+    sp = sub.add_parser("tasks", help="명세의 AC로 tasks.md 생성")
+    add_path(sp)
+    sp.add_argument("slug", nargs="?", default=None,
+                    help="대상 명세 슬러그 (생략하면 activeSpec)")
+    sp.set_defaults(func=cmd_tasks)
+
+    sp = sub.add_parser("review-report", help="리뷰 리포트 골격 생성 (trace 결과 반영)")
+    add_path(sp)
+    sp.add_argument("slug", nargs="?", default=None,
+                    help="대상 명세 슬러그 (생략하면 activeSpec)")
+    sp.set_defaults(func=cmd_review_report)
 
     sp = sub.add_parser("list", help="모든 명세 나열")
     add_path(sp)
