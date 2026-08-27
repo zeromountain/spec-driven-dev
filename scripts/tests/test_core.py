@@ -448,7 +448,8 @@ def _run(root: Path, feature=None, **kw):
                            resume=kw.get("resume", False), restart=kw.get("restart", False),
                            max_attempts=kw.get("max_attempts", sdd.DEFAULT_MAX_ATTEMPTS),
                            depth=kw.get("depth"), spec=kw.get("spec"),
-                           all=kw.get("all", False), worktree=kw.get("worktree")))
+                           all=kw.get("all", False), worktree=kw.get("worktree"),
+                           from_stage=kw.get("from_stage")))
 
 
 def _next(root: Path, spec=None, all=False):
@@ -679,6 +680,51 @@ class PipelineTests(unittest.TestCase):
             fresh = _run(root, "테스트 기능", restart=True)
             self.assertTrue(fresh["started"])
             self.assertEqual(len(sdd.load_state(root)["pipelineHistory"]), 1)
+
+    def test_reopen_review_applies_the_new_roster(self):
+        """플러그인 업그레이드로 리뷰어가 늘었을 때 명세·구현을 그대로 두고 리뷰만 다시 연다."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(tmp)
+            spec_rel = _run(root, "테스트 기능")["next"]["context"]["specPath"]
+            _write_valid_spec(root, spec_rel)
+            _advance(root, {})
+            _advance(root, {"testResult": {"passed": 1, "failed": 0}})
+            _advance(root, {"verdict": "approved"})
+            self.assertEqual(_next(root)["action"], "done")
+            first_report = sdd.load_pipelines(sdd.load_state(root))["테스트-기능"]["reviewPath"]
+
+            out = _run(root, from_stage="review", spec="테스트-기능", depth="deep")
+            self.assertTrue(out["ok"])
+            self.assertEqual(out["from"], {"stage": "done", "status": "done"})
+            self.assertEqual(out["rosterBefore"], ["spec-reviewer"])
+            self.assertEqual(out["roster"], ["spec-reviewer", "code-reviewer"])
+            self.assertEqual(out["next"]["action"], "call-agents")
+            # 리포트는 새로 만든다 — 낡은 리포트에는 새 리뷰어 절이 없다
+            reopened = sdd.load_pipelines(sdd.load_state(root))["테스트-기능"]
+            self.assertNotEqual(reopened["reviewPath"], first_report)
+            # 명세는 건드리지 않았다
+            self.assertTrue((root / spec_rel).exists())
+
+    def test_reopen_needs_an_existing_pipeline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(tmp)
+            out = _run(root, from_stage="review", spec="없는-기능")
+            self.assertFalse(out["ok"])
+            self.assertIn("파이프라인이 없다", out["reason"])
+
+    def test_reopen_implement_keeps_the_spec_version(self):
+        """--restart 와 달리 명세 버전을 올리지 않는다."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(tmp)
+            spec_rel = _run(root, "테스트 기능")["next"]["context"]["specPath"]
+            _write_valid_spec(root, spec_rel)
+            _advance(root, {})
+            _advance(root, {"testResult": {"passed": 1, "failed": 0}})
+            out = _run(root, from_stage="implement", spec="테스트-기능")
+            self.assertEqual(out["next"]["stage"], "implement")
+            self.assertEqual(out["next"]["context"]["specPath"], spec_rel)
+            self.assertEqual(
+                len(list((root / "specs" / "테스트-기능").glob("spec-v*.md"))), 1)
 
     def test_advance_rejects_stage_mismatch(self):
         with tempfile.TemporaryDirectory() as tmp:

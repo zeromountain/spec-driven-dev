@@ -245,3 +245,25 @@ sdd.py advance --spec 기능-b --result '<json>'
 git 저장소가 아니면 워크트리를 만들지 못한다. 그때 `run`은 파이프라인을 막지 않고 본체에서
 돌리되 `worktreeWarning`에 사유를 담는다 — 조용히 본체에서 도는 일이 없게 한다.
 
+## 끝난 단계를 다시 열기 (`run --from`)
+
+```bash
+sdd.py run --spec <슬러그> --from review [--depth deep]
+```
+
+`done`·`halted` 인 파이프라인의 특정 단계를 되연다. `--restart` 와 다르다 — `--restart`
+는 파이프라인을 새로 만들어 **명세 버전을 올린다.** `--from` 은 `specPath`·`specVersion`
+과 carry 를 유지하고 그 단계만 되돌린다.
+
+되열 때 `refresh_roster` 가 다시 돌아 **지금 버전의 로스터가 적용된다.** 반환값의
+`rosterBefore` / `roster` 로 무엇이 달라졌는지 알 수 있다 — 리뷰어가 1명에서 4명으로
+늘어난 업그레이드 뒤에 리뷰만 다시 돌리는 것이 주 용도다.
+
+단계별로 되돌리는 것:
+
+| `--from` | 초기화되는 것 |
+|---|---|
+| `review` | `reviewPath`(리포트를 새로 만든다), 리뷰 재시도 카운트, 누적된 리뷰어 결과 |
+| `implement` | 구현 재시도 카운트, 직전 테스트 실패, 구현 결함 |
+| `spec` | 명세 재시도·감사 카운트 |
+

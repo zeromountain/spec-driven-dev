@@ -2409,6 +2409,46 @@ def _advance_review(root: Path, pipe: dict, result: dict) -> None:
                 "approved 또는 changes-requested 여야 한다")
 
 
+def reopen_pipeline(root: Path, pipe: dict, stage: str, depth=None) -> dict:
+    """끝났거나 멈춘 파이프라인을 특정 단계부터 다시 연다.
+
+    로스터가 바뀌었을 때(플러그인 업그레이드로 리뷰어가 늘었을 때 등) 명세·구현을
+    그대로 두고 그 단계만 다시 돌리기 위한 경로다. `--restart` 는 파이프라인을 새로
+    만들어 명세 버전을 올려 버리므로 이 용도에 맞지 않는다."""
+    if stage not in PIPELINE_STAGES:
+        return {"ok": False, "reason": f"알 수 없는 단계: {stage}"}
+
+    was = {"stage": pipe.get("stage"), "status": pipe.get("status")}
+    pipe["status"] = "running"
+    pipe["haltReason"] = None
+    pipe["carry"]["reviewResults"] = []
+    pipe["carry"]["reviewVerdicts"] = []
+    if stage == "review":
+        # 리포트 골격을 새로 만들게 한다 — 낡은 리포트에 새 리뷰어 절이 없다.
+        pipe["reviewPath"] = None
+        pipe["attempts"]["review"] = 0
+    elif stage == "implement":
+        pipe["attempts"]["implement"] = 0
+        pipe["carry"]["testFailures"] = None
+        pipe["carry"]["implementationDefects"] = []
+    else:
+        pipe["attempts"]["spec"] = 0
+        pipe["attempts"]["specAudit"] = 0
+
+    if depth is not None:
+        pipe["forcedDepth"] = depth
+    before = stage_roster(pipe, stage)
+    d = refresh_roster(root, pipe)
+    _enter_stage(pipe, stage)
+    _record(pipe, "reopened", fromStage=was["stage"], fromStatus=was["status"],
+            stage=stage, depth=d["depth"])
+    _persist_pipeline(root, pipe)
+    return {"ok": True, "reopened": True, "slug": pipe["slug"], "from": was,
+            "stage": stage, "depth": d["depth"], "deepReasons": d["deepReasons"],
+            "rosterBefore": before, "roster": d["agents"][stage],
+            "next": compute_next(root, pipe["slug"])}
+
+
 def _run_all(root: Path, pipes: dict, resume: bool = False) -> dict:
     """살아 있는 파이프라인 전부를 대상으로 배치 루프를 연다.
 
@@ -2453,6 +2493,20 @@ def cmd_run(args) -> dict:
     feature = (getattr(args, "feature", None) or "").strip()
     explicit = getattr(args, "spec", None)
     all_mode = getattr(args, "all", False)
+    from_stage = getattr(args, "from_stage", None)
+
+    if from_stage:
+        target = explicit or (slugify(args.slug) if getattr(args, "slug", None) else None) \
+            or (slugify(feature) if feature else None) \
+            or resolve_pipeline_slug(state, allow_active=True)
+        pipe = pipes.get(target)
+        if not pipe:
+            return {"ok": False, "board": board(root),
+                    "reason": (f"'{target}' 파이프라인이 없다 — `--from` 은 이미 있는 "
+                               "파이프라인의 단계를 다시 여는 것이다. 새로 시작하려면 "
+                               "기능 설명만 준다"),
+                    "pipelines": sorted(pipes)}
+        return reopen_pipeline(root, pipe, from_stage, getattr(args, "depth", None))
 
     if all_mode and not feature:
         return _run_all(root, pipes, resume=bool(getattr(args, "resume", False)))
@@ -2810,6 +2864,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="자동 깊이 판정을 덮어쓴다 (파이프라인 내내 유지된다)")
     sp.add_argument("--spec", default=None,
                     help="재개할 파이프라인 슬러그 (여러 개가 살아 있을 때)")
+    sp.add_argument("--from", dest="from_stage", default=None,
+                    choices=list(PIPELINE_STAGES),
+                    help="이미 있는 파이프라인을 이 단계부터 다시 연다 "
+                         "(명세·구현은 그대로 두고 로스터만 새로 적용된다)")
     sp.add_argument("--all", action="store_true",
                     help="살아 있는 파이프라인 전부를 대상으로 배치 루프를 연다 "
                          "(--resume 과 함께 주면 halted 인 것도 되살린다)")

@@ -5,6 +5,8 @@ argument-hint: [슬러그] [--deep|--light], 예: user-marital-status (비우면
 
 `spec-driven-dev` 스킬을 **review 모드**로 실행한다. 대상 슬러그: **$ARGUMENTS**
 
+대상 파이프라인이 이미 `done`이면 `sdd.py run --spec <슬러그> --from review`로 리뷰
+단계를 다시 연다(명세·구현은 그대로 두고 로스터만 새로 적용된다). 그 외에는
 파이프라인 루프를 **한 번만** 돌린다. `sdd.py next`가 review 단계를 지시하면 리뷰 리포트
 골격은 이미 `.sdd/reviews/`에 만들어져 있고 커버리지·미커버 AC·게이트 위반이 채워져 있다 —
 그 값을 근거로 주고 `next.agents[]`의 리뷰어를 **한 메시지에서 동시에** 호출한다
