@@ -2443,10 +2443,18 @@ def reopen_pipeline(root: Path, pipe: dict, stage: str, depth=None) -> dict:
     _record(pipe, "reopened", fromStage=was["stage"], fromStatus=was["status"],
             stage=stage, depth=d["depth"])
     _persist_pipeline(root, pipe)
-    return {"ok": True, "reopened": True, "slug": pipe["slug"], "from": was,
-            "stage": stage, "depth": d["depth"], "deepReasons": d["deepReasons"],
-            "rosterBefore": before, "roster": d["agents"][stage],
-            "next": compute_next(root, pipe["slug"])}
+    out = {"ok": True, "reopened": True, "slug": pipe["slug"], "from": was,
+           "stage": stage, "depth": d["depth"], "deepReasons": d["deepReasons"],
+           "forcedDepth": pipe.get("forcedDepth"),
+           "rosterBefore": before, "roster": d["agents"][stage],
+           "next": compute_next(root, pipe["slug"])}
+    # 예전에 걸어둔 --depth 가 남아 임계값을 덮고 있으면 조용히 넘어가지 않는다.
+    if pipe.get("forcedDepth") and d["deepReasons"] and d["depth"] == "light":
+        out["warning"] = (
+            f"forcedDepth='{pipe['forcedDepth']}' 가 남아 있어 깊이 판정을 덮고 있다 — "
+            f"명세 자체는 deep 근거를 {len(d['deepReasons'])}개 갖고 있다. 전체 로스터로 "
+            "돌리려면 `--depth deep` 을 함께 준다")
+    return out
 
 
 def _run_all(root: Path, pipes: dict, resume: bool = False) -> dict:
