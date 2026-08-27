@@ -12,6 +12,7 @@
 - [퍼블리시 전 로컬 테스트](#퍼블리시-전-로컬-테스트)
 - [프로젝트에 SDD 켜기](#프로젝트에-sdd-켜기)
 - [하드 페이즈 게이트 켜기](#하드-페이즈-게이트-켜기)
+- [워크트리 켜기](#워크트리-켜기-두-호스트-모두)
 - [호스트별 차이](#호스트별-차이)
 - [업데이트](#업데이트)
 - [제거](#제거)
@@ -110,8 +111,24 @@ claude
 ```
 cd ~/my-project
 codex
-$sdd:spec-driven-dev init 해줘
+$sdd:spec-driven-dev SDD 설정해줘
 ```
+
+Codex에는 슬래시 커맨드가 없으므로 **의도를 말로 전한다.** 스킬이 그 의도를 모드로 옮긴다:
+
+| 하고 싶은 것 | Codex에서 | (Claude Code) |
+|---|---|---|
+| 스캐폴딩 | `$sdd:spec-driven-dev SDD 설정해줘` | `/sdd:init` |
+| 기능 하나를 끝까지 | `$sdd:spec-driven-dev <기능> — 명세부터 끝까지` | `/sdd:run <기능>` |
+| 기능을 하나 더 (병렬) | `$sdd:spec-driven-dev <다른 기능>도 시작해줘` | `/sdd:run <기능>` |
+| 걸린 것 전부 진행 | `$sdd:spec-driven-dev 걸린 거 전부 같이 진행해줘` | `/sdd:run --all` |
+| 현황 보기 | `$sdd:spec-driven-dev 지금 뭐뭐 돌고 있어` | `/sdd:board` |
+| 이어서 하기 | `$sdd:spec-driven-dev 아까 하던 거 이어서` | `/sdd:run` |
+| 명세만 검토 | `$sdd:spec-driven-dev 명세 좀 봐줘` | `/sdd:audit` |
+| 워크트리 정리 | `$sdd:spec-driven-dev 워크트리 정리해줘` | `/sdd:worktree remove` |
+
+깊이를 직접 정하려면 "깊게" / "가볍게"를 덧붙인다(`--deep`/`--light`에 대응). 진행 위치는
+`.sdd/state.json`에 남으므로 세션이 끊겨도 "아까 하던 거 이어서"로 같은 자리에서 이어진다.
 
 `init`은 다음을 만든다: `specs/`, `.sdd/state.json`(세션 로컬, gitignore됨),
 `.sdd/config.json`(팀 공유, 커밋됨), `.sdd/reviews/`, 그리고 프로젝트의 `AGENTS.md`(없으면
@@ -138,6 +155,26 @@ find ~/.claude/plugins/cache ~/spec-driven-dev -maxdepth 5 -type d -path '*sdd*/
 탈출구는 [`README.md`의 "페이즈 게이트"](../README.md#페이즈-게이트-claude-code-전용)와
 `skills/spec-driven-dev/references/phase-gate.md`에 있다.
 
+## 워크트리 켜기 (두 호스트 모두)
+
+기능마다 독립된 git 워크트리에서 작업하게 하면 병렬 실행에서 파일이 겹치지 않는다.
+`/sdd:init`(Claude Code)이나 "SDD 설정해줘"(Codex)가 물어보고, 나중에 켜려면:
+
+```bash
+python3 <플러그인 경로>/scripts/sdd.py init --path . --worktrees
+```
+
+`.sdd/config.json`의 `"worktrees": true`가 되고, 기능마다
+`.sdd/worktrees/<슬러그>/`에 체크아웃과 `sdd/<슬러그>` 브랜치가 생긴다(그 디렉터리는
+`.sdd/.gitignore`에 자동으로 들어간다). git 저장소가 아니면 본체에서 돌되 그 사실을
+`worktreeWarning`으로 알린다.
+
+Claude Code에서는 여기에 더해 **훅이 워크트리 경로로 파이프라인을 식별해 각자의 단계로
+판정**하므로, 하드 게이트를 켠 채로도 페이즈가 다른 기능들이 동시에 돈다. Codex에서는
+훅이 없으므로 파일 격리만 얻는다.
+
+브랜치는 자동으로 병합되지 않는다 — 승인되면 경로와 브랜치 이름만 알려준다.
+
 ## 호스트별 차이
 
 플러그인 매니페스트가 두 개인 이유: Claude Code는 `.claude-plugin/plugin.json`을, Codex는
@@ -150,12 +187,30 @@ find ~/.claude/plugins/cache ~/spec-driven-dev -maxdepth 5 -type d -path '*sdd*/
 | `commands/*.md` (`/sdd:*`) | ✅ | ❌ (스킬을 직접 호출) |
 | `agents/*.md` (서브에이전트 10개) | ✅ | ❌ (Codex 플러그인은 서브에이전트 정의를 지원하지 않는다) |
 | `hooks/hooks.json` (페이즈 게이트) | ✅ (opt-in) | ❌ (Codex 플러그인 매니페스트에 훅 필드가 없다) |
-| `scripts/sdd.py` (CLI) | ✅ | ✅ (스킬이 Bash로 호출) |
+| `scripts/sdd.py` (파이프라인·깊이·스케줄러·워크트리) | ✅ | ✅ (스킬이 Bash로 호출) |
 
-Codex에서는 `spec-driven-dev` 스킬 하나가 10개 역할을 **하나의 세션 안에서 순서대로 직접 수행**한다 — 별도 서브에이전트로 위임하지
-않는다. 역할 경계(예: "Spec Architect는 src/를 쓰지 않는다")는 스킬 프롬프트로만
-지켜지고, Claude Code처럼 훅이 실제로 차단하지는 않는다. `sdd.py guard`는 두 호스트
-모두에서 동작하므로, Codex에서는 이걸로 사후에 위반 여부를 확인한다.
+**`sdd.py`에 있는 것은 두 호스트에서 똑같이 동작한다** — 파이프라인 상태머신, `depth`의
+역할 구성 판정, 파이프라인 레지스트리와 병렬 스케줄러, 워크트리,
+`validate`/`trace`/`guard`. 차이는 두 가지뿐이다.
+
+**1. 역할을 누가 수행하는가.** Codex에서는 `spec-driven-dev` 스킬 하나가 10개 역할을
+**한 세션 안에서 순서대로 직접 수행**한다. `next`가 지정한 `agent`의 프롬프트를 스킬이
+직접 맡는데, `agents/*.md`는 Codex에 설치되지 않으므로 역할의 책임·금지 사항은
+`references/roles.md`가 근거다. `sdd.py depth`가 "이번엔 어느 역할까지 도는가"를 똑같이
+정해 주지만, 각 역할이 **독립된 컨텍스트에서 도는 이점은 Claude Code에서만** 얻는다 —
+구현자/테스트 작성자 분리와 리뷰어 4종의 독립 판정은 Codex에서 순차적 자기 점검에 가깝다.
+
+**2. 게이트가 실제로 막는가.** 역할 경계(예: "Spec Architect는 src/를 쓰지 않는다")는
+Codex에서 스킬 프롬프트로만 지켜진다. 그래서 리뷰 단계의 `sdd.py guard`가 Codex에서는
+선택이 아니라 필수다 — 위반이 있었는지 드러나는 유일한 지점이다.
+
+여기서 따라오는 실무 조언 하나: **Codex 전용 프로젝트라면 `enforce`를 켜지 마라.** 훅이
+없어 아무것도 막히지 않는데, `schedule()`은 `enforce: true`를 보고 같은 페이즈끼리만
+동시에 돌린다 — 막지도 못하면서 병렬성만 줄어든다.
+
+**워크트리는 Codex에서도 동작한다**(git만 있으면 된다). 파일 격리는 그대로 얻지만,
+"훅이 워크트리 경로로 파이프라인을 식별해 각자의 단계로 판정한다"는 이점은 훅이 없으니
+해당 없다.
 
 ## 업데이트
 
@@ -205,6 +260,18 @@ zeromountain/spec-driven-dev`로 저장소가 실제로 존재하는지, `.claud
 `codex plugin list --json`으로 설치 여부를 먼저 확인한다. Codex는 슬래시 커맨드가
 아니라 스킬 트리거이므로, 정확한 문법 대신 "SDD로 시작해줘" 같은 자연어로 스킬의
 `description`이 자동으로 매칭되게 해도 된다.
+
+**Codex에서 `/sdd:run` 같은 커맨드가 없다.**
+Codex 플러그인 매니페스트에는 커맨드 필드 자체가 없다 — 정상이다. 위 "설치 후 첫 실행"의
+대응표대로 의도를 말로 전한다.
+
+**Codex인데 여러 기능이 동시에 안 돌아간다.**
+`sdd.py board`의 `waiting` 사유를 본다. "페이즈 게이트가 …를 잡고 있다"면 이 프로젝트의
+`.sdd/state.json`에 `enforce: true`가 남아 있는 것이다 — Codex에는 훅이 없어 막지도
+못하면서 스케줄러만 같은 페이즈로 묶는다. `sdd.py phase off`로는 풀리지 않는다(스케줄러가
+기다리는 쪽 단계로 페이즈를 다시 고른다). `.sdd/state.json`의 `enforce`를 `false`로
+바꿔야 한다 — 이 파일은 세션 로컬이고 gitignore되므로 손으로 고쳐도 안전하다. 대신 리뷰
+단계에서 `sdd.py guard`로 위반을 반드시 확인한다.
 
 **하드 게이트를 켰는데 정상적인 쓰기까지 막힌다.**
 `.sdd/state.json`의 `phase`를 확인한다(`sdd.py status`). 페이즈와 쓰려는 경로가

@@ -141,7 +141,7 @@ codex --plugin-dir ~/spec-driven-dev              # Codex CLI
 ```
 
 `/sdd:init` 실행 시 하드 페이즈 게이트(파일 쓰기를 실제로 차단하는 훅)를 켤지 물어본다.
-꺼둔 채로도 세 역할 분리와 명세 규약은 그대로 적용된다 — 다만 강제는 프롬프트 수준이다.
+꺼둔 채로도 역할 분리와 명세 규약은 그대로 적용된다 — 다만 강제는 프롬프트 수준이다.
 
 ### 파이프라인
 
@@ -156,21 +156,35 @@ spec ──validate 통과──▶ implement ──테스트 통과──▶ re
  └──specChangeRequests──────┘      changes-requested └──▶ implement (gaps 인계)
 ```
 
-진행 위치는 `.sdd/state.json`의 `pipeline` 레코드 하나에만 있으므로 세션이 끊기거나
+진행 위치는 `.sdd/state.json`의 `pipelines[<슬러그>]` 레코드에만 있으므로 세션이 끊기거나
 컨텍스트가 날아가도 `/sdd:run`을 인자 없이 다시 부르면 같은 자리에서 이어진다. 멈추는
 경우는 미결 질문(`ask-user`)과 재시도 상한 초과(`halted`) 둘뿐이고, 단계별 상한은 기본
 2회, 전체 전이 상한은 24회다. 전이표·인계 항목·중단 사유는
 [`references/pipeline.md`](skills/spec-driven-dev/references/pipeline.md)에 있다.
 
-**Codex CLI** — 슬래시 커맨드 대신 스킬을 직접 부른다:
+**Codex CLI** — 슬래시 커맨드가 없으니 스킬을 직접 부르고 의도를 말로 전한다:
 ```
-$sdd:spec-driven-dev init 해줘
-$sdd:spec-driven-dev 사용자 엔티티에 결혼여부 필드 추가 — 명세부터 시작
+$sdd:spec-driven-dev SDD 설정해줘                      # init
+$sdd:spec-driven-dev 결혼여부 필드 추가 — 명세부터 끝까지   # run
+$sdd:spec-driven-dev 결제 취소 정책도 시작해줘            # 앞의 것과 병렬로 걸린다
+$sdd:spec-driven-dev 지금 뭐뭐 돌고 있어                # board
+$sdd:spec-driven-dev 걸린 거 전부 같이 진행해줘           # run --all
+$sdd:spec-driven-dev 아까 하던 거 이어서                # resume
 ```
-Codex는 플러그인 커맨드·서브에이전트·훅을 지원하지 않는다(스킬만 설치된다) — `sdd`의
-세 역할 분리와 페이즈 관리는 Codex에서 전부 `spec-driven-dev` 스킬 하나가 순서대로
-직접 수행하고, 하드 페이즈 게이트(파일 쓰기 차단)는 Claude Code에서만 동작한다. 자세한
-차이는 [`docs/SETUP.md`의 "호스트별 차이"](docs/SETUP.md#호스트별-차이)를 본다.
+
+파이프라인·깊이 판정·스케줄러·워크트리는 전부 `sdd.py`에 있어 **두 호스트에서 똑같이
+동작한다.** 다른 것은 두 가지뿐이다:
+
+| | Claude Code | Codex CLI |
+|---|---|---|
+| 10개 역할 | 서브에이전트가 각자 독립된 컨텍스트에서 | 스킬 하나가 순서대로 직접 수행 |
+| 페이즈 게이트 | 훅이 실제로 쓰기를 차단 | 훅 없음 — `sdd.py guard`로 사후 점검 |
+
+그래서 Codex에서는 구현자/테스트 작성자 분리와 리뷰어 4종의 독립 판정이 **순차적 자기
+점검에 가깝다.** 워크트리는 Codex에서도 파일을 격리하지만, "훅이 파이프라인별로 판정한다"는
+이점은 훅이 없으니 해당 없다. Codex 전용 프로젝트라면 `enforce`를 켜지 않는 편이 병렬성에
+유리하다 — 막지도 못하면서 스케줄러만 같은 페이즈로 묶는다. 자세한 차이는
+[`docs/SETUP.md`의 "호스트별 차이"](docs/SETUP.md#호스트별-차이)를 본다.
 
 ## 페이즈 게이트 (Claude Code 전용)
 

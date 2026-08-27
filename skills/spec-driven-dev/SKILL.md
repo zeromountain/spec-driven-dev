@@ -69,18 +69,47 @@ PreToolUse 훅이 페이즈 경계를 실제로 막는다. 진행 위치와 **�
 
 ## 모드
 
-| 모드 | 트리거 | 실행 |
+Claude Code에는 슬래시 커맨드가 있고, Codex CLI에는 없다(플러그인 커맨드를 지원하지
+않는다). **모드는 커맨드가 아니라 사용자의 의도로 정한다** — 아래 "말로 하면" 열이
+Codex에서의 진입점이다.
+
+| 모드 | Claude Code | 말로 하면 (Codex) | 실행 |
+|---|---|---|---|
+| init | `/sdd:init` | "SDD 설정해줘" | `sdd.py init` → 스캐폴딩, AGENTS.md 병합, 게이트·워크트리 여부 확인 |
+| run | `/sdd:run <설명> [--deep\|--light]` | "<기능> 명세부터 만들어서 끝까지" | 파이프라인 시작 → **next/advance 루프**를 끝까지 돌린다 |
+| resume | `/sdd:run` (인자 없이) | "아까 하던 거 이어서" | 중단된 파이프라인을 그 자리에서 재개 |
+| run-all | `/sdd:run --all` | "지금 걸린 거 전부 같이 돌려줘" | 살아 있는 파이프라인 **전부**를 배치 루프로 |
+| board | `/sdd:board` | "지금 뭐뭐 돌고 있어" | 살아 있는 파이프라인 전부의 위치·실행 가능 여부 |
+| worktree | `/sdd:worktree <list\|status\|add\|remove>` | "워크트리 정리해줘" | 기능별 워크트리 조회·생성·정리 |
+| spec / implement / review | `/sdd:spec` 등 | "명세만 / 구현만 / 리뷰만" | 루프를 **한 번만** 돌린다 (수동 스텝) |
+| audit | `/sdd:audit [슬러그]` | "명세 좀 봐줘" | `spec-auditor`만 단독 호출 (파이프라인 밖) |
+| status | `/sdd:status` | "지금 어디까지 했지" | `sdd.py status` JSON을 표로 렌더 |
+| phase | `/sdd:phase <spec\|implement\|review\|off>` | "게이트 잠깐 꺼줘" | 수동 전환 (평소엔 불필요) |
+
+## 호스트별 차이
+
+`sdd.py`와 이 스킬은 두 호스트에서 똑같이 동작한다. 다른 것은 **역할을 누가 수행하는가**와
+**게이트가 실제로 막는가**뿐이다.
+
+| | Claude Code | Codex CLI |
 |---|---|---|
-| init | `/sdd:init` | `sdd.py init` → 스캐폴딩, AGENTS.md 병합, 하드 게이트 여부 확인 |
-| run | `/sdd:run <설명> [--deep\|--light]` | 파이프라인 시작 → **next/advance 루프**를 끝까지 돌린다 |
-| resume | `/sdd:run` (인자 없이) | 중단된 파이프라인을 그 자리에서 재개 |
-| run-all | `/sdd:run --all` | 살아 있는 파이프라인 **전부**를 배치 루프로 끝까지 돌린다 |
-| board | `/sdd:board` | 살아 있는 파이프라인 전부의 위치·실행 가능 여부 |
-| worktree | `/sdd:worktree <list\|status\|add\|remove>` | 기능별 워크트리 조회·생성·정리 |
-| spec / implement / review | `/sdd:spec` 등 | 루프를 **한 번만** 돌린다 (수동 스텝) |
-| audit | `/sdd:audit [슬러그]` | `spec-auditor`만 단독 호출 (파이프라인 밖에서 명세만 재검토) |
-| status | `/sdd:status` | `sdd.py status` JSON을 표로 렌더 (파이프라인 위치·깊이 포함) |
-| phase | `/sdd:phase <spec\|implement\|review\|off>` | 수동 전환 (파이프라인이 알아서 하므로 평소엔 불필요) |
+| 10개 역할 | 서브에이전트가 각자 **독립된 컨텍스트**에서 | 이 스킬 하나가 **순서대로 직접** 수행 |
+| 리뷰어 동시 호출 | 진짜 병렬, 서로의 판정을 못 봄 | 한 컨텍스트 안 — 순차적 자기 점검에 가깝다 |
+| 페이즈 게이트 | PreToolUse 훅이 실제로 차단 | **훅 없음** — `sdd.py guard`로 사후 점검 |
+| 파이프라인·깊이·스케줄러·워크트리 | 동일 | 동일 (전부 `sdd.py`) |
+
+**Codex에서 역할을 수행할 때:** 서브에이전트가 없으므로 `next`가 지정한 `agent`의 프롬프트를
+네가 직접 맡는다. `agents/<이름>.md`는 Codex에 설치되지 않으니, 역할의 책임·금지 사항은
+`references/roles.md`를 근거로 삼는다. 특히 **구현자 역할과 테스트 작성자 역할을 한
+호흡에 섞지 마라** — 순차로 하더라도 명세를 먼저 읽고 기대값을 정한 뒤 구현을 본다.
+
+**Codex에서 `enforce`는 무의미하다.** 훅이 없어 아무것도 막히지 않는데, `schedule()`은
+`enforce: true`를 보고 같은 페이즈끼리만 동시에 돌린다. Codex 전용 프로젝트라면
+`.sdd/config.json`이 아니라 `.sdd/state.json`의 `enforce`를 `false`로 두는 편이
+병렬성에 유리하다. 대신 리뷰 단계에서 `sdd.py guard`로 위반을 반드시 확인한다.
+
+**워크트리는 Codex에서도 그대로 동작한다**(git만 있으면 된다). 다만 얻는 것이 하나 줄어든다 —
+파일 격리는 그대로지만, "훅이 파이프라인별로 판정한다"는 이점은 훅이 없으니 해당 없다.
 
 ## 워크플로
 
