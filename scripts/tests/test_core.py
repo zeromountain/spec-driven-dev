@@ -726,6 +726,23 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(
                 len(list((root / "specs" / "테스트-기능").glob("spec-v*.md"))), 1)
 
+    def test_review_report_is_rebuilt_when_deleted(self):
+        """리포트를 지우고 재개하면 새로 만든다 — 없는 파일을 채우라고 시키지 않는다."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(tmp)
+            spec_rel = _run(root, "테스트 기능")["next"]["context"]["specPath"]
+            _write_valid_spec(root, spec_rel)
+            _advance(root, {})
+            _advance(root, {"testResult": {"passed": 1, "failed": 0}})
+            first = _next(root)["agents"][0]["context"]["reviewPath"]
+            self.assertTrue((root / first).exists())
+
+            (root / first).unlink()
+            again = _next(root)["agents"][0]["context"]["reviewPath"]
+            self.assertTrue((root / again).exists())
+            body = (root / again).read_text(encoding="utf-8")
+            self.assertIn("AC-1", body)
+
     def test_advance_rejects_stage_mismatch(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = _init_project(tmp)

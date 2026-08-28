@@ -2030,6 +2030,13 @@ def _next_review(root: Path, pipe: dict) -> dict:
     phase = transition_phase(root, "review", pipe["slug"])
     refresh_roster(root, pipe)
 
+    # 기록된 리포트가 사라졌으면 다시 만든다 — 없는 파일을 채우라고 시킬 수는 없다.
+    recorded = pipe.get("reviewPath")
+    if recorded and not (root / recorded).exists():
+        _record(pipe, "review-report-missing", path=recorded)
+        pipe["reviewPath"] = None
+        pipe["carry"]["reviewResults"] = []
+
     if not pipe.get("reviewPath"):
         rep = build_review_report(root, pipe["slug"], force=pipe.get("forcedDepth"),
                                   workdir=pipeline_workdir(root, pipe))
