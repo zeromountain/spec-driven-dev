@@ -1415,7 +1415,8 @@ class WorktreeTests(unittest.TestCase):
             _advance(root, {"openQuestions": []}, spec="기능-하나")
 
             state, config = sdd.load_state(root), sdd.load_config(root)
-            self.assertEqual(state["phase"], "implement")
+            # 격리된 파이프라인은 전역 페이즈를 밀지 않는다 — 판정은 경로가 한다
+            self.assertEqual(state["phase"], "off")
 
             phase, rel, owner = sdd.resolve_write(
                 str(root / ".sdd/worktrees/기능-둘/src/a.py"), root, state, config)
@@ -1491,6 +1492,132 @@ class WorktreeTests(unittest.TestCase):
             self.assertTrue(out["ok"])
             self.assertIsNone(out["worktree"])
             self.assertIn("git 저장소가 아니다", out["worktreeWarning"])
+
+    def test_hand_edited_worktree_field_does_not_crash(self):
+        """상태를 손으로 고쳐 worktree 가 경로 문자열로 들어와도 하네스는 살아 있어야 한다.
+
+        실제로 있었던 일이다 — 형식이 어긋났다고 board·next 가 통째로 죽으면 그 파이프라인은
+        재개할 방법이 없어진다."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _git_project(tmp)
+            _run(root, "기능 하나")
+            state = sdd.load_state(root)
+            state["pipelines"]["기능-하나"]["worktree"] = ".sdd/worktrees/기능-하나"
+            sdd.write_json(root / ".sdd" / "state.json", state)
+
+            pipe = sdd.load_pipelines(sdd.load_state(root))["기능-하나"]
+            self.assertTrue(sdd.is_isolated(root, pipe))
+            row = [r for r in sdd.cmd_board(_ns(path=str(root)))["pipelines"]
+                   if r["slug"] == "기능-하나"][0]
+            self.assertEqual(row["worktree"], ".sdd/worktrees/기능-하나")
+            self.assertTrue(_next(root)["context"]["workdir"]
+                            .endswith(".sdd/worktrees/기능-하나"))
+
+    def test_isolated_pipeline_leaves_the_global_phase_alone(self):
+        """워크트리 파이프라인이 단계를 넘어도 전역 페이즈는 그대로다.
+
+        페이즈는 프로젝트에 하나뿐이라, 격리된 쪽이 그걸 밀면 본체를 쓰는 다른
+        파이프라인의 게이트 판정이 남의 단계로 바뀐다."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _git_project(tmp, enforce=True)
+            _run(root, "기능 하나")
+            _write_valid_spec(root, _next(root, spec="기능-하나")["context"]["specPath"])
+            _advance(root, {"openQuestions": []}, spec="기능-하나")
+
+            pipes = sdd.load_pipelines(sdd.load_state(root))
+            self.assertEqual(pipes["기능-하나"]["stage"], "implement")
+            self.assertEqual(sdd.load_state(root)["phase"], "off")
+
+            # 본체를 쓰는 파이프라인은 예전 그대로 전역 페이즈를 잡는다
+            _run(root, "기능 둘", worktree=False)
+            _next(root, spec="기능-둘")
+            self.assertEqual(sdd.load_state(root)["phase"], "spec")
+
+    def test_main_tree_spec_writes_are_judged_by_their_owner(self):
+        """명세는 워크트리를 써도 본체에 있다 — 그래도 경로가 주인을 말해 준다."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _git_project(tmp, enforce=True)
+            _run(root, "기능 하나")                 # 워크트리, spec 단계
+            _run(root, "기능 둘", worktree=False)   # 본체, implement 로 간다
+            _write_valid_spec(root, _next(root, spec="기능-둘")["context"]["specPath"])
+            _advance(root, {"openQuestions": []}, spec="기능-둘")
+
+            state, config = sdd.load_state(root), sdd.load_config(root)
+            self.assertEqual(state["phase"], "implement")
+
+            # 기능-하나 는 아직 spec 단계다. 남이 잡은 implement 로 판정하면 자기
+            # 명세를 못 쓰게 된다.
+            phase, rel, owner = sdd.resolve_write(
+                str(root / "specs/기능-하나/spec-v1.md"), root, state, config)
+            self.assertEqual((phase, owner), ("spec", "기능-하나"))
+            self.assertIsNone(sdd.evaluate_gate(phase, rel, config))
+
+            # 주인이 없는 본체 경로는 예전처럼 전역 페이즈로 판정된다
+            phase, rel, owner = sdd.resolve_write(
+                str(root / "specs/README.md"), root, state, config)
+            self.assertEqual((phase, rel, owner), ("implement", "specs/README.md", None))
+
+
+class StateConcurrencyTests(unittest.TestCase):
+    """`.sdd/state.json` 은 워크트리를 써도 공유 자원이다 — 여기서 잃으면 끝이다."""
+
+    def test_write_json_is_atomic_for_concurrent_readers(self):
+        """쓰는 도중 읽어도 잘린 JSON 이 보이면 안 된다 (load_state 가 빈 상태로 떨어진다)."""
+        import threading
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(tmp)
+            path = root / ".sdd" / "state.json"
+            big = {"version": 1, "phase": "off",
+                   "pipelines": {f"p{i}": {"slug": f"p{i}", "history": ["x" * 300]}
+                                 for i in range(60)}}
+            stop, torn = threading.Event(), []
+
+            def reader():
+                while not stop.is_set():
+                    if sdd.read_json(path) is None:
+                        torn.append(1)
+
+            t = threading.Thread(target=reader, daemon=True)
+            t.start()
+            try:
+                for _ in range(80):
+                    sdd.write_json(path, big)
+            finally:
+                stop.set()
+                t.join(timeout=5)
+            self.assertEqual(torn, [])
+            self.assertEqual(list((root / ".sdd").glob("*.tmp")), [])
+
+    def test_concurrent_pipeline_writes_do_not_lose_each_other(self):
+        """동시에 들어온 파이프라인 갱신이 서로를 덮어쓰면 안 된다."""
+        import threading
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(tmp)
+            pipes = [sdd._new_pipeline(f"기능 {i}", f"f{i}", 2) for i in range(8)]
+            threads = [threading.Thread(target=sdd._persist_pipeline, args=(root, pipe))
+                       for pipe in pipes]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=10)
+            stored = sdd.load_pipelines(sdd.load_state(root))
+            self.assertEqual(sorted(stored), sorted(pipe["slug"] for pipe in pipes))
+
+    def test_state_lock_is_exclusive(self):
+        """락은 실제로 배타적이어야 한다 — 아니면 위 두 테스트가 우연히 통과한 것이다."""
+        import threading
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(tmp)
+            with sdd.state_lock(root) as held:
+                self.assertTrue(held)
+                second = []
+                t = threading.Thread(
+                    target=lambda: second.append(
+                        sdd.state_lock(root, timeout=0.2).__enter__()))
+                t.start()
+                t.join(timeout=5)
+                self.assertEqual(second, [False])
+
 
 if __name__ == "__main__":
     unittest.main()

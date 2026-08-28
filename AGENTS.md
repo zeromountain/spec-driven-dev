@@ -81,6 +81,18 @@ Keep the two manifests' `version` fields in lockstep — `scripts/validate.py` e
   skill to pick agents on vibes. `depth_haystack()` excludes the spec's `범위 밖` section and
   unfilled `{{...}}` placeholders: an exclusion clause and the template's own boilerplate are
   not signals.
+- **State is shared even when worktrees are not.** `.sdd/state.json` is the one resource
+  every pipeline and every session writes. Every mutation goes through `update_state()`
+  (re-read under an exclusive `.sdd/state.lock`, patch only your own slice, write), and
+  `write_json()` swaps the file in with `os.replace` — an in-place write is visible to a
+  concurrent reader as truncated JSON, which `load_state()` turns into an empty registry.
+  Never add a `load_state → mutate → write_json` sequence outside `update_state()`.
+- **The global phase belongs to the main tree.** A pipeline with a worktree calls
+  `transition_phase(..., apply=False)`: it still gets the verdict (an `implement` transition
+  still demands a valid spec) but never writes `state["phase"]`, because there is only one
+  phase per project and pushing it would re-judge every other pipeline's writes. Writes are
+  attributed by path instead — `resolve_write()` owns both `.sdd/worktrees/<slug>/...` and
+  the main tree's `<specsDir>/<slug>/...`.
 - **Concurrency is decided by `schedule()`, not by the model.** Pipelines live in
   `state["pipelines"][slug]`; `activePipeline` is only a focus hint. Two constraints bound
   parallelism and both are structural, not stylistic: the phase gate is *project-wide* (the

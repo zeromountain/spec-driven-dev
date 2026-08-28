@@ -9,14 +9,22 @@ stdlib만 사용한다 (외부 의존성 없음).
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as dt
 import fnmatch
 import json
+import os
 import re
 import subprocess
 import sys
+import time
 import unicodedata
 from pathlib import Path
+
+try:  # flock 이 없는 환경에서는 잠그지 않고 진행한다 (동작은 예전과 같다)
+    import fcntl
+except ImportError:  # pragma: no cover - POSIX 외
+    fcntl = None
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TEMPLATES_DIR = REPO_ROOT / "templates"
@@ -151,8 +159,86 @@ def read_json(path: Path):
 
 
 def write_json(path: Path, data) -> None:
+    """같은 디렉터리에 임시 파일로 쓰고 os.replace 로 갈아끼운다.
+
+    제자리 쓰기는 truncate 후 기록이라 그 사이에 다른 세션이 읽으면 잘린 JSON 을 본다.
+    read_json 은 그걸 None 으로 돌려주고 load_state 는 빈 기본 상태를 반환하므로, 그
+    상태로 한 번만 저장되면 파이프라인 레지스트리가 통째로 사라진다. 교체는 원자적이어야
+    한다."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    text = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+
+
+STATE_LOCK_NAME = "state.lock"
+
+
+@contextlib.contextmanager
+def state_lock(root: Path, timeout: float = 10.0):
+    """`.sdd/state.lock` 을 배타적으로 잡는다.
+
+    상태 갱신은 전부 읽기→수정→쓰기다. 두 세션(또는 한 세션이 병렬로 띄운 두 Bash 호출)이
+    이 구간에 겹쳐 들어오면 나중 쓰기가 앞의 갱신을 지운다 — 워크트리는 코드 파일만
+    격리하고 `.sdd/state.json` 은 여전히 공유 자원이라 여기서 막아야 한다.
+
+    잠그지 못해도 예외를 던지지 않는다(예전 동작으로 진행한다) — 하네스를 멈추는 것보다
+    낫고, 잡았는지 여부는 yield 값으로 알 수 있다."""
+    lock_path = root / ".sdd" / STATE_LOCK_NAME
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        fresh = not lock_path.exists()
+        handle = open(lock_path, "a+")
+    except OSError:
+        yield False
+        return
+    if fresh:
+        _ensure_gitignore_entry(root / ".sdd" / ".gitignore", STATE_LOCK_NAME)
+    if fcntl is None:
+        handle.close()
+        yield False
+        return
+    deadline = time.monotonic() + timeout
+    held = False
+    try:
+        while True:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                held = True
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(0.02)
+        yield held
+    finally:
+        if held:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
+
+
+def update_state(root: Path, mutate) -> dict:
+    """상태를 락 안에서 다시 읽어 `mutate` 만큼만 고치고 저장한다.
+
+    상태를 미리 읽어둔 사본에 덮어쓰면 그 사이 다른 파이프라인이 넣은 갱신이 사라진다.
+    상태를 고치는 경로는 전부 이 함수를 지난다."""
+    state = None
+
+    def _apply():
+        nonlocal state
+        state = load_state(root)
+        mutate(state)
+        state["updatedAt"] = now_iso()
+        write_json(root / ".sdd" / "state.json", state)
+
+    with state_lock(root):
+        _apply()
+    return state
 
 
 def load_config(root: Path) -> dict:
@@ -682,7 +768,7 @@ def resolve_write(file_path: str, project_root: Path, state: dict, config: dict)
     pipes = load_pipelines(state)
 
     for slug, pipe in pipes.items():
-        wt = (pipe.get("worktree") or {}).get("rel")
+        wt = worktree_of(pipe).get("rel")
         if not wt:
             continue
         rel = to_project_relative(file_path, project_root / wt)
@@ -699,7 +785,31 @@ def resolve_write(file_path: str, project_root: Path, state: dict, config: dict)
     if _under(rel, wt_dir):
         # 워크트리 디렉터리 안인데 주인을 못 찾았다 — 판정하지 않는다.
         return None, None, None
+
+    # 명세와 tasks.md 는 워크트리를 써도 본체에만 있다. 그래도 경로에 슬러그가 들어
+    # 있으므로 주인을 알 수 있다 — 남의 파이프라인이 잡고 있는 전역 페이즈로 판정하면
+    # 워크트리를 켜 놓고도 자기 명세를 못 쓰게 된다.
+    owner = spec_path_owner(rel, pipes, config)
+    if owner:
+        return pipes[owner].get("stage"), rel, owner
+
     return state.get("phase", "off"), rel, None
+
+
+def spec_path_owner(rel: str, pipes: dict, config: dict):
+    """`<specsDir>/<슬러그>/…` 경로가 살아 있는 파이프라인의 것이면 그 슬러그를 준다."""
+    specs_dir = config.get("specsDir", DEFAULT_CONFIG["specsDir"]).strip("/")
+    if not _under(rel, specs_dir) or not specs_dir:
+        return None
+    parts = rel.split("/")
+    depth = len(specs_dir.split("/"))
+    if len(parts) <= depth + 1:      # specs/README.md 처럼 슬러그 디렉터리 밖이다
+        return None
+    slug = parts[depth]
+    pipe = pipes.get(slug) or {}
+    if pipe.get("status") in LIVE_STATUSES and pipe.get("stage") in PIPELINE_STAGES:
+        return slug
+    return None
 
 
 def guard_violations(changed_files, phase: str, config: dict):
@@ -823,10 +933,7 @@ def cmd_init(args) -> dict:
         created.append(str(state_path.relative_to(root)))
     else:
         if args.enforce:
-            st = load_state(root)
-            st["enforce"] = True
-            st["updatedAt"] = now_iso()
-            write_json(state_path, st)
+            update_state(root, lambda st: st.update({"enforce": True}))
         skipped.append(str(state_path.relative_to(root)))
 
     config_path = sdd_dir / "config.json"
@@ -851,7 +958,7 @@ def cmd_init(args) -> dict:
 
     gitignore_path = sdd_dir / ".gitignore"
     if not gitignore_path.exists():
-        gitignore_path.write_text("state.json\nworktrees/\n", encoding="utf-8")
+        gitignore_path.write_text("state.json\nstate.lock\nworktrees/\n", encoding="utf-8")
         created.append(str(gitignore_path.relative_to(root)))
     else:
         skipped.append(str(gitignore_path.relative_to(root)))
@@ -1048,10 +1155,7 @@ def cmd_depth(args) -> dict:
                             getattr(args, "feature", None), getattr(args, "force", None))
     state_path = root / ".sdd" / "state.json"
     if state_path.exists():
-        state = load_state(root)
-        state["depth"] = result["depth"]
-        state["updatedAt"] = now_iso()
-        write_json(state_path, state)
+        update_state(root, lambda st: st.update({"depth": result["depth"]}))
         result["stateUpdated"] = True
     else:
         result["stateUpdated"] = False
@@ -1106,7 +1210,7 @@ def cmd_status(args) -> dict:
         if phase not in (None, "off"):
             violations += guard_violations(git_changed_files(root), phase, config)
         for slug, pipe in sorted(pipes.items()):
-            if not (pipe.get("worktree") or {}).get("rel"):
+            if not worktree_of(pipe).get("rel"):
                 continue
             stage = pipe.get("stage")
             if stage not in PIPELINE_STAGES:
@@ -1127,8 +1231,12 @@ def cmd_status(args) -> dict:
     }
 
 
-def transition_phase(root: Path, target: str, slug=None) -> dict:
-    """페이즈를 전환한다. `/sdd:phase`와 파이프라인이 공유하는 단일 구현."""
+def transition_phase(root: Path, target: str, slug=None, apply: bool = True) -> dict:
+    """페이즈를 전환한다. `/sdd:phase`와 파이프라인이 공유하는 단일 구현.
+
+    `apply=False` 면 전환 가능 여부만 판정하고 전역 상태는 건드리지 않는다. 워크트리를
+    가진 파이프라인이 쓰는 경로다 — 페이즈는 프로젝트에 하나뿐이라, 격리된 파이프라인이
+    자기 단계로 그걸 밀어 버리면 본체를 쓰는 다른 파이프라인의 게이트 판정이 바뀐다."""
     state = load_state(root)
     from_phase = state.get("phase", "off")
     blocked = False
@@ -1159,15 +1267,17 @@ def transition_phase(root: Path, target: str, slug=None) -> dict:
                     reasons.append("spec 검증 실패: "
                                    + "; ".join(e["message"] for e in v["errors"]))
 
-    if not blocked:
-        state["phase"] = target
-        state.setdefault("enforce", False)
-        if target_slug:
-            state["activeSpec"] = target_slug
-        state["updatedAt"] = now_iso()
-        write_json(root / ".sdd" / "state.json", state)
+    applied = not blocked and apply
+    if applied:
+        def _mutate(st):
+            st["phase"] = target
+            st.setdefault("enforce", False)
+            if target_slug:
+                st["activeSpec"] = target_slug
 
-    return {"from": from_phase, "to": target, "blocked": blocked,
+        update_state(root, _mutate)
+
+    return {"from": from_phase, "to": target, "blocked": blocked, "applied": applied,
             "reasons": reasons, "activeSpec": target_slug}
 
 
@@ -1401,6 +1511,15 @@ def create_worktree(root: Path, slug: str, config=None) -> dict:
     return {"ok": True, "created": True, "base": base, **paths}
 
 
+def _ensure_gitignore_entry(target: Path, entry: str) -> None:
+    """`target` (.gitignore) 에 `entry` 가 없으면 덧붙인다."""
+    lines = target.read_text(encoding="utf-8").splitlines() if target.exists() else []
+    if entry.rstrip("/") in [l.strip().rstrip("/") for l in lines]:
+        return
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("\n".join(lines + [entry]).strip() + "\n", encoding="utf-8")
+
+
 def _ensure_worktrees_ignored(root: Path, config: dict) -> None:
     """워크트리 디렉터리가 본체의 추적 대상이 되면 안 된다."""
     wt_dir = config.get("worktreesDir", DEFAULT_CONFIG["worktreesDir"]).strip("/")
@@ -1408,11 +1527,7 @@ def _ensure_worktrees_ignored(root: Path, config: dict) -> None:
         target, entry = root / ".sdd" / ".gitignore", wt_dir[len(".sdd/"):] + "/"
     else:
         target, entry = root / ".gitignore", wt_dir + "/"
-    lines = target.read_text(encoding="utf-8").splitlines() if target.exists() else []
-    if entry.rstrip("/") in [l.strip().rstrip("/") for l in lines]:
-        return
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text("\n".join(lines + [entry]).strip() + "\n", encoding="utf-8")
+    _ensure_gitignore_entry(target, entry)
 
 
 def remove_worktree(root: Path, slug: str, config=None, force: bool = False) -> dict:
@@ -1443,9 +1558,31 @@ def worktree_status(root: Path, slug: str, config=None) -> dict:
             "changedCount": len(files), "ahead": ahead, **paths}
 
 
+def worktree_of(pipe: dict) -> dict:
+    """파이프라인의 워크트리 레코드를 항상 dict 로 읽는다.
+
+    손으로 고친 상태 파일에서 이 필드가 경로 문자열로 들어오는 일이 실제로 있었다.
+    형식이 어긋났다고 하네스 전체가 죽으면 안 된다 — 읽을 수 있는 만큼만 읽는다."""
+    wt = (pipe or {}).get("worktree")
+    if isinstance(wt, dict):
+        return wt
+    if isinstance(wt, str) and wt.strip():
+        return {"rel": wt.strip()}
+    return {}
+
+
+def is_isolated(root: Path, pipe: dict) -> bool:
+    """이 파이프라인이 자기 워크트리 안에서만 움직이는가.
+
+    기록만 있고 디렉터리가 사라졌으면 격리가 아니다 — 그때 쓰기는 본체로 떨어지므로
+    전역 페이즈로 판정되어야 한다."""
+    wt = worktree_of(pipe)
+    return bool(wt.get("rel")) and (root / wt["rel"]).exists()
+
+
 def pipeline_workdir(root: Path, pipe: dict) -> Path:
     """이 파이프라인의 코드가 사는 디렉터리. 워크트리가 없으면 본체다."""
-    wt = (pipe or {}).get("worktree") or {}
+    wt = worktree_of(pipe)
     if wt.get("rel"):
         target = root / wt["rel"]
         if target.exists():
@@ -1514,14 +1651,15 @@ def _persist_pipeline(root: Path, pipe: dict, focus: bool = True) -> None:
     """state.json을 새로 읽어 이 파이프라인만 갈아끼운다 — transition_phase가 중간에
     같은 파일을 쓰기 때문에 통째로 덮어쓰면 phase 변경이 유실된다."""
     pipe["updatedAt"] = now_iso()
-    state = load_state(root)
-    pipes = load_pipelines(state)
-    pipes[pipe["slug"]] = pipe
-    if focus:
-        state["activePipeline"] = pipe["slug"]
-    _store_pipelines(state, pipes)
-    state["updatedAt"] = now_iso()
-    write_json(root / ".sdd" / "state.json", state)
+
+    def _mutate(st):
+        pipes = load_pipelines(st)
+        pipes[pipe["slug"]] = pipe
+        if focus:
+            st["activePipeline"] = pipe["slug"]
+        _store_pipelines(st, pipes)
+
+    update_state(root, _mutate)
 
 
 def _record(pipe: dict, event: str, **detail) -> None:
@@ -1590,8 +1728,8 @@ def pipeline_summary(pipe) -> dict:
         "agent": current_agent(pipe) if pipe.get("stage") in PIPELINE_STAGES else None,
         "roster": (pipe.get("roster") or {}).get(pipe.get("stage")),
         "depth": pipe.get("depth"),
-        "worktree": (pipe.get("worktree") or {}).get("rel"),
-        "branch": (pipe.get("worktree") or {}).get("branch"),
+        "worktree": worktree_of(pipe).get("rel"),
+        "branch": worktree_of(pipe).get("branch"),
         "attempts": pipe.get("attempts"),
         "maxAttempts": pipe.get("maxAttempts"),
         "steps": pipe.get("steps"),
@@ -1666,7 +1804,7 @@ def schedule(root: Path) -> dict:
 
     def isolated(p):
         """워크트리를 가진 파이프라인은 자기 디렉터리 안에서만 움직인다."""
-        return bool((p.get("worktree") or {}).get("rel"))
+        return is_isolated(root, p)
 
     waiting = []
     if enforce:
@@ -1904,7 +2042,9 @@ def _call_reviewers(pipe: dict, context: dict, instruction: str, phase=None) -> 
 def _next_spec(root: Path, pipe: dict) -> dict:
     config = load_config(root)
     specs_dir = root / config["specsDir"]
-    phase = transition_phase(root, "spec", pipe["slug"])
+    # 격리된 파이프라인은 전역 페이즈를 밀지 않는다 — 판정만 받는다.
+    phase = transition_phase(root, "spec", pipe["slug"],
+                             apply=not is_isolated(root, pipe))
     refresh_roster(root, pipe)
 
     if not pipe.get("specPath"):
@@ -1960,7 +2100,9 @@ def _next_spec(root: Path, pipe: dict) -> dict:
 
 def _next_implement(root: Path, pipe: dict) -> dict:
     config = load_config(root)
-    phase = transition_phase(root, "implement", pipe["slug"])
+    # 격리된 파이프라인은 전역 페이즈를 밀지 않는다 — 판정만 받는다.
+    phase = transition_phase(root, "implement", pipe["slug"],
+                             apply=not is_isolated(root, pipe))
     refresh_roster(root, pipe)
     if phase["blocked"]:
         _halt(pipe, "implement 페이즈 전환이 차단됐다: " + "; ".join(phase["reasons"]))
@@ -1984,7 +2126,7 @@ def _next_implement(root: Path, pipe: dict) -> dict:
         "testDirs": config["testDirs"],
         "acPattern": config["acPattern"],
         "workdir": str(pipeline_workdir(root, pipe)),
-        "worktree": pipe.get("worktree"),
+        "worktree": worktree_of(pipe) or None,
         "previousTestFailures": carry.get("testFailures"),
         "reviewGaps": carry.get("reviewGaps") or [],
         "lastReviewPath": pipe.get("lastReviewPath"),
@@ -2027,7 +2169,9 @@ def _next_implement(root: Path, pipe: dict) -> dict:
 
 def _next_review(root: Path, pipe: dict) -> dict:
     config = load_config(root)
-    phase = transition_phase(root, "review", pipe["slug"])
+    # 격리된 파이프라인은 전역 페이즈를 밀지 않는다 — 판정만 받는다.
+    phase = transition_phase(root, "review", pipe["slug"],
+                             apply=not is_isolated(root, pipe))
     refresh_roster(root, pipe)
 
     # 기록된 리포트가 사라졌으면 다시 만든다 — 없는 파일을 채우라고 시킬 수는 없다.
@@ -2390,9 +2534,10 @@ def _advance_review(root: Path, pipe: dict, result: dict) -> None:
         spec_path = root / pipe["specPath"]
         # status를 쓰려면 specs/ 쓰기가 열려 있어야 한다. 게이트를 우회하는 대신
         # 정식으로 spec 페이즈로 되돌린 뒤 고치고 off로 닫는다.
-        transition_phase(root, "spec", pipe["slug"])
+        apply_phase = not is_isolated(root, pipe)
+        transition_phase(root, "spec", pipe["slug"], apply=apply_phase)
         ok = set_spec_status(spec_path, "done") if spec_path.exists() else False
-        transition_phase(root, "off", pipe["slug"])
+        transition_phase(root, "off", pipe["slug"], apply=apply_phase)
         pipe["status"] = "done"
         pipe["stage"] = "done"
         _record(pipe, "approved", specStatusUpdated=ok, reviewPath=pipe.get("reviewPath"))
@@ -2566,10 +2711,14 @@ def cmd_run(args) -> dict:
                 "live": live}
 
     if pipe:
-        archive = state.setdefault("pipelineHistory", [])
-        archive.append(pipeline_summary(pipe))
-        del archive[:-5]
-        write_json(root / ".sdd" / "state.json", state)
+        summary = pipeline_summary(pipe)
+
+        def _archive(st):
+            archive = st.setdefault("pipelineHistory", [])
+            archive.append(summary)
+            del archive[:-5]
+
+        update_state(root, _archive)
 
     pipe = _new_pipeline(feature, slug, args.max_attempts)
     pipe["forcedDepth"] = getattr(args, "depth", None)
@@ -2594,7 +2743,7 @@ def cmd_run(args) -> dict:
     _record(pipe, "started", feature=feature, slug=slug, depth=d["depth"])
     _persist_pipeline(root, pipe)
     result = {"ok": True, "started": True, "slug": slug,
-              "worktree": pipe.get("worktree"),
+              "worktree": worktree_of(pipe) or None,
               "pipeline": pipeline_summary(pipe),
               "depth": {"depth": d["depth"], "forcedTo": d["forcedTo"],
                         "deepReasons": d["deepReasons"], "agents": d["agents"],
@@ -2633,7 +2782,7 @@ def cmd_worktree(args) -> dict:
     if action == "list":
         rows = []
         for slug, pipe in sorted(pipes.items()):
-            if not (pipe.get("worktree") or {}).get("rel"):
+            if not worktree_of(pipe).get("rel"):
                 continue
             row = worktree_status(root, slug, config)
             row.update({"slug": slug, "stage": pipe.get("stage"),
