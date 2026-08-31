@@ -29,9 +29,13 @@
 ├── AGENTS.md          # 없으면 생성, 있으면 섹션만 append/교체
 ├── specs/
 │   ├── README.md
-│   └── <slug>/
-│       ├── spec-v<N>.md
-│       └── tasks.md
+│   ├── <slug>/            # 진행 중
+│   │   ├── spec-v<N>.md
+│   │   └── tasks.md
+│   └── archive/            # 리뷰 승인으로 완료된 것 (디렉터리째 이동)
+│       └── <slug>/
+│           ├── spec-v<N>.md
+│           └── tasks.md
 └── .sdd/
     ├── state.json      # 세션 로컬 (gitignore) — pipelines 레지스트리가 여기 산다
     ├── config.json     # 팀 공유 (커밋)

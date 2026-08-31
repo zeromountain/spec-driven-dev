@@ -107,6 +107,23 @@ Keep the two manifests' `version` fields in lockstep — `scripts/validate.py` e
   `action: "call-agents"` (even when the roster holds one) and `advance` takes
   `{"reviews": [...]}`. `combine_verdicts()` takes the worst verdict, never an average, and
   halts if any roster member's result is missing — there is no path to approving on a subset.
+- **A live pipeline's spec is never in the archive.** Approval ticks every remaining
+  `- [ ]` in the spec and `tasks.md`, writes `status: done`, and moves
+  `<specsDir>/<slug>/` **as a directory** to `<specsDir>/archive/<slug>/` — flattening
+  would break `_validate_frontmatter`'s `feature` == parent-directory check. Anything
+  that brings a slug back to life restores it first, and there are exactly three such
+  chokepoints: `cmd_run` (after `load_config`, *before* `refresh_roster`),
+  `reopen_pipeline` (before its own `refresh_roster` and `compute_next`), and
+  `create_spec_file`. Ordering is load-bearing — the roster derives depth by reading the
+  spec off disk and silently downgrades to `light` when it's missing, and `next` halts
+  the pipeline when `build_review_report` can't find it. Restoring also rewrites
+  `specPath`/`tasksPath`; `reopen_pipeline` never touches those fields itself. **Never
+  teach `find_latest_version` to scan the archive** — three callers feed its return value
+  straight into `specs_dir/slug/spec-v{N}.md".read_text()`, so a version that only exists
+  in the archive turns into `FileNotFoundError`. Restoring earlier removes that class
+  entirely. The tick helper converts existing boxes only: adding one to an EC bullet makes
+  `EC_LINE_RE` stop recognizing it, which fails validation and halts the next
+  `implement` transition.
 - **The gate enforces phase boundaries, not intra-phase role separation.** PreToolUse
   payloads carry no subagent identity, so `software-engineer` writing to `tests/` in deep
   mode is not blocked. Read-only roles are enforced by having no write tool in their
@@ -185,3 +202,11 @@ echo '{"cwd":"/tmp/x","tool_name":"Write","tool_input":{"file_path":"/tmp/x/src/
   after the fact via `git diff`/`git status` instead.
 - It does not overwrite a target project's existing `AGENTS.md`/`CLAUDE.md` — it appends or
   replaces only the `## Spec-Driven Development` section.
+- It does not offer an `archiveOnDone` switch. Ticking the spec's checkboxes and archiving
+  the directory on approval are unconditional — the behavior was the request, and a knob
+  would just add a state in which the docs and the pipeline disagree.
+- It does not keep the archive move out of `guard` entirely. `evaluate_gate` whitelists
+  `<specsDir>/archive/**`, which covers the `??` half of an uncommitted move; the `D
+  <specsDir>/<slug>/…` half is an ordinary `specs/` path and can still surface in another
+  live pipeline's guard rows until it's committed. That is the same class the in-place
+  `status: done` write always had, so it's documented rather than engineered around.

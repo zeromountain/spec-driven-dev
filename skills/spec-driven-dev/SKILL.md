@@ -132,7 +132,8 @@ ls -d ~/spec-driven-dev/scripts 2>/dev/null \
 ### 0단계: 컨텍스트 확인
 
 `$S/sdd.py status --path <project-root>`로 현재 phase·명세 목록·게이트 위반·파이프라인
-위치를 먼저 본다. `.sdd/state.json`이 없으면 아직 `/sdd:init`이 실행되지 않은 것이다 —
+위치를 먼저 본다. `specs[]`는 진행 중인 것, `archived[]`는 완료돼
+`specs/archive/`로 옮겨진 것이다 — 사용자에게 보여줄 때 둘을 섞지 않는다. `.sdd/state.json`이 없으면 아직 `/sdd:init`이 실행되지 않은 것이다 —
 init부터 안내한다.
 
 ### 1단계: 파이프라인 루프 (run 모드 — 기본 경로)
@@ -160,8 +161,10 @@ $S/sdd.py run "<기능 설명>" --path <root>
 **루프 중 하지 말 것:**
 
 - `next`가 시키지 않은 일을 미리 하지 마라. 페이즈 전환, 명세 파일 생성, `tasks.md`,
-  리뷰 리포트 골격, 승인 시 `status: done` 갱신은 **전부 `next`/`advance`가 이미 했다**.
-  `phase`·`new`·`tasks`·`review-report`를 손으로 부르면 상태가 어긋난다.
+  리뷰 리포트 골격, 승인 시 `status: done` 갱신·**남은 체크박스 채우기**·**명세
+  아카이빙**은 **전부 `next`/`advance`가 이미 했다**. `phase`·`new`·`tasks`·
+  `review-report`를 손으로 부르면 상태가 어긋난다. 완료된 명세를 손으로 체크하거나
+  `specs/archive/`로 옮기지도 마라 — 되열 때 자동으로 되돌아온다.
 - `advance`를 건너뛰고 다음 서브에이전트를 부르지 마라 — 그 순간 파이프라인이 제자리에 남는다.
 - 단계 사이에서 사용자에게 "계속할까요?"를 묻지 마라. 멈추는 건 `ask-user`와 `halted`뿐이다.
 - 재시도 횟수를 세지 마라. `attempts`/`maxAttempts`는 `advance`가 센다.

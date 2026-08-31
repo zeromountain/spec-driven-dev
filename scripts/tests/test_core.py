@@ -519,9 +519,22 @@ class PipelineTests(unittest.TestCase):
             after_review = _advance(root, {"verdict": "approved"})
             self.assertEqual(after_review["next"]["action"], "done")
             self.assertEqual(after_review["pipeline"]["status"], "done")
-            fm, _ = sdd.parse_frontmatter((root / spec_rel).read_text(encoding="utf-8"))
-            self.assertEqual(fm["status"], "done")
             self.assertEqual(sdd.load_state(root)["phase"], "off")
+
+            # 승인은 명세를 아카이브로 옮긴다 — 본체에는 남지 않는다.
+            archived = root / "specs" / "archive" / "테스트-기능" / "spec-v1.md"
+            self.assertTrue(archived.exists())
+            self.assertFalse((root / "specs" / "테스트-기능").exists())
+            self.assertEqual(after_review["pipeline"]["specPath"],
+                             "specs/archive/테스트-기능/spec-v1.md")
+
+            body = archived.read_text(encoding="utf-8")
+            fm, _ = sdd.parse_frontmatter(body)
+            self.assertEqual(fm["status"], "done")
+            # 남은 TODO가 없어야 한다 — 명세도 tasks.md도.
+            self.assertNotIn("- [ ]", body)
+            self.assertNotIn("- [ ]", (root / "specs" / "archive" / "테스트-기능"
+                                       / "tasks.md").read_text(encoding="utf-8"))
 
     def test_invalid_spec_retries_then_halts(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1617,6 +1630,228 @@ class StateConcurrencyTests(unittest.TestCase):
                 t.start()
                 t.join(timeout=5)
                 self.assertEqual(second, [False])
+
+
+class TickCheckboxesTests(unittest.TestCase):
+    """완료 시 남은 TODO를 채우되, 문서의 다른 성질은 하나도 바꾸지 않는다."""
+
+    def _write(self, tmp, text):
+        p = Path(tmp) / "spec-v1.md"
+        p.write_text(text, encoding="utf-8")
+        return p
+
+    def test_ticks_every_open_box(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = self._write(tmp, VALID_SPEC)
+            self.assertEqual(sdd.tick_all_checkboxes(p), 2)
+            body = p.read_text(encoding="utf-8")
+            self.assertNotIn("- [ ]", body)
+            self.assertIn("- [x] **AC-1**", body)
+
+    def test_ticked_spec_still_validates_identically(self):
+        """[x]도 AC로 파싱된다 — 체크가 AC 개수나 검증 결과를 바꾸면 안 된다."""
+        with tempfile.TemporaryDirectory() as tmp:
+            p = self._write(tmp, VALID_SPEC)
+            before = sdd.validate_spec(VALID_SPEC)
+            sdd.tick_all_checkboxes(p)
+            after = sdd.validate_spec(p.read_text(encoding="utf-8"))
+            self.assertEqual(before["acIds"], after["acIds"])
+            self.assertEqual(before["ecIds"], after["ecIds"])
+            self.assertEqual(before["valid"], after["valid"])
+
+    def test_error_cases_never_gain_a_checkbox(self):
+        """EC_LINE_RE는 체크박스가 붙은 줄을 EC로 인정하지 않는다 — 붙이면 검증이 깨진다."""
+        with tempfile.TemporaryDirectory() as tmp:
+            p = self._write(tmp, VALID_SPEC)
+            sdd.tick_all_checkboxes(p)
+            body = p.read_text(encoding="utf-8")
+            self.assertIn("- **EC-1**:", body)
+            self.assertEqual(sdd.validate_spec(body)["ecIds"], ["EC-1"])
+
+    def test_indented_boxes_keep_their_indent(self):
+        """extract_id_items는 line.strip()으로 매칭하므로 들여쓴 AC도 유효한 AC다."""
+        with tempfile.TemporaryDirectory() as tmp:
+            p = self._write(tmp, "## 인수 기준\n\n  - [ ] **AC-1**: 조건이 맞으면 통과해야 한다.\n")
+            sdd.tick_all_checkboxes(p)
+            self.assertIn("  - [x] **AC-1**", p.read_text(encoding="utf-8"))
+
+    def test_code_fences_are_left_alone(self):
+        """명세가 마크다운 형식 자체를 예시로 담을 수 있다 — 예시는 할 일이 아니다."""
+        with tempfile.TemporaryDirectory() as tmp:
+            p = self._write(tmp, "- [ ] 진짜 항목\n\n```md\n- [ ] 예시일 뿐\n```\n")
+            self.assertEqual(sdd.tick_all_checkboxes(p), 1)
+            body = p.read_text(encoding="utf-8")
+            self.assertIn("- [x] 진짜 항목", body)
+            self.assertIn("- [ ] 예시일 뿐", body)
+
+    def test_missing_file_is_not_an_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(sdd.tick_all_checkboxes(Path(tmp) / "없다.md"), 0)
+
+
+class ArchiveTests(unittest.TestCase):
+    """완료된 명세는 specs/archive/<슬러그>/ 로 옮겨지고, 다시 열면 되돌아온다."""
+
+    def _approve(self, root, feature="테스트 기능", **kw):
+        spec_rel = _run(root, feature, **kw)["next"]["context"]["specPath"]
+        _write_valid_spec(root, spec_rel)
+        _advance(root, {})
+        _advance(root, {"testResult": {"passed": 1, "failed": 0}})
+        return _advance(root, {"verdict": "approved"})
+
+    def test_approval_moves_the_whole_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(tmp)
+            self._approve(root)
+            arch = root / "specs" / "archive" / "테스트-기능"
+            self.assertTrue((arch / "spec-v1.md").exists())
+            self.assertTrue((arch / "tasks.md").exists())
+            self.assertFalse((root / "specs" / "테스트-기능").exists())
+
+    def test_listing_separates_archived_from_live(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(tmp)
+            self._approve(root)
+            listing = sdd.list_specs(root)
+            self.assertEqual(listing["specs"], [])
+            self.assertEqual([a["slug"] for a in listing["archived"]], ["테스트-기능"])
+            self.assertEqual(listing["archived"][0]["status"], "done")
+
+    def test_status_reports_archived_separately(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(tmp)
+            self._approve(root)
+            st = sdd.cmd_status(_ns(path=str(root)))
+            self.assertEqual(st["specs"], [])
+            self.assertEqual([a["slug"] for a in st["archived"]], ["테스트-기능"])
+
+    def test_restart_restores_and_versions_forward(self):
+        """되살아난 명세는 v1을 덮지 않고 v2로 이어진다 — 아카이브본과 충돌하지 않는다."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(tmp)
+            self._approve(root)
+            out = _run(root, "테스트 기능", restart=True)
+            self.assertTrue((root / "specs" / "테스트-기능" / "spec-v1.md").exists())
+            self.assertFalse((root / "specs" / "archive" / "테스트-기능").exists())
+            self.assertEqual(out["next"]["context"]["specPath"],
+                             "specs/테스트-기능/spec-v2.md")
+
+    def test_direct_new_on_an_archived_slug_continues_numbering(self):
+        """파이프라인 없이 `sdd.py new` 만 부르는 경로도 복원을 거친다."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(tmp)
+            self._approve(root)
+            created = sdd.create_spec_file(root, "테스트 기능", "테스트-기능")
+            self.assertEqual(created["version"], 2)
+            self.assertTrue((root / "specs" / "테스트-기능" / "spec-v1.md").exists())
+
+    def test_reopen_restores_before_the_roster_is_derived(self):
+        """깊이를 강제하지 않아도 로스터가 명세 본문으로 판정된다 (조용한 강등 방지)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(tmp)
+            deep_spec = VALID_SPEC.replace(
+                "- [ ] **AC-2**: 조건 B에서 오류가 발생하면 안 된다.",
+                "\n".join(f"- [ ] **AC-{i}**: 조건 {i}가 충족되면 값을 반환해야 한다."
+                          for i in range(2, 11)))
+            spec_rel = _run(root, "테스트 기능")["next"]["context"]["specPath"]
+            (root / spec_rel).write_text(deep_spec, encoding="utf-8")
+            _advance(root, {})
+            _advance(root, {"testResult": {"passed": 1, "failed": 0}})
+            _advance(root, {"verdict": "approved"})
+
+            out = _run(root, from_stage="review", spec="테스트-기능")
+            self.assertTrue(out["ok"])
+            self.assertTrue((root / spec_rel).exists())
+            self.assertEqual(out["roster"], ["spec-reviewer", "code-reviewer"])
+            self.assertEqual(out["next"]["action"], "call-agents")
+
+    def test_reopen_repoints_the_pipeline_at_the_restored_spec(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(tmp)
+            self._approve(root)
+            out = _run(root, from_stage="review", spec="테스트-기능")
+            self.assertEqual(out["restored"]["dir"], "specs/테스트-기능")
+            self.assertEqual(out["specPath"], "specs/테스트-기능/spec-v1.md")
+            # 상태에도 남아야 한다 — 되열린 파이프라인이 아카이브를 계속 가리키면 안 된다.
+            self.assertEqual(sdd.load_pipelines(sdd.load_state(root))["테스트-기능"]["specPath"],
+                             "specs/테스트-기능/spec-v1.md")
+
+    def test_existing_archive_never_overwrites_a_live_spec(self):
+        """복원은 없는 파일만 채운다 — 아카이브본이 살아 있는 작업물을 덮으면 안 된다."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(tmp)
+            self._approve(root)
+            live = root / "specs" / "테스트-기능"
+            live.mkdir(parents=True)
+            (live / "spec-v1.md").write_text("살아 있는 작업물", encoding="utf-8")
+            sdd.unarchive_spec_dir(root, "테스트-기능")
+            self.assertEqual((live / "spec-v1.md").read_text(encoding="utf-8"),
+                             "살아 있는 작업물")
+            self.assertTrue((live / "tasks.md").exists())
+
+    def test_archive_collision_does_not_halt_an_approved_pipeline(self):
+        """정리 작업이 실패해도 승인 판정을 뒤집지 않는다."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(tmp)
+            spec_rel = _run(root, "테스트 기능")["next"]["context"]["specPath"]
+            _write_valid_spec(root, spec_rel)
+            _advance(root, {})
+            _advance(root, {"testResult": {"passed": 1, "failed": 0}})
+            blocker = root / "specs" / "archive" / "테스트-기능"
+            blocker.mkdir(parents=True)
+            (blocker / "spec-v1.md").write_text("먼저 있던 것", encoding="utf-8")
+
+            out = _advance(root, {"verdict": "approved"})
+            self.assertEqual(out["pipeline"]["status"], "done")
+            self.assertEqual(out["next"]["action"], "done")
+            self.assertEqual((blocker / "spec-v1.md").read_text(encoding="utf-8"),
+                             "먼저 있던 것")
+            # 명세는 제자리에 남되 체크와 status는 이미 기록됐다.
+            self.assertNotIn("- [ ]", (root / spec_rel).read_text(encoding="utf-8"))
+
+    def test_approval_clears_active_spec(self):
+        """완료된 슬러그가 activeSpec으로 남으면 --spec 없는 phase implement가 막힌다."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(tmp)
+            self._approve(root)
+            self.assertIsNone(sdd.load_state(root).get("activeSpec"))
+
+    def test_archive_is_writable_in_every_phase(self):
+        """이동은 커밋 전까지 git에 남는다 — 다른 파이프라인의 guard 위반이 되면 안 된다."""
+        for phase in ("spec", "implement", "review"):
+            self.assertIsNone(
+                sdd.evaluate_gate(phase, "specs/archive/x/spec-v1.md", DEFAULT_CONFIG))
+        self.assertEqual(
+            sdd.guard_violations(["specs/archive/x/spec-v1.md"], "review", DEFAULT_CONFIG),
+            [])
+
+    def test_archive_is_a_reserved_slug(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(tmp)
+            self.assertFalse(_run(root, "archive")["ok"])
+            self.assertFalse(sdd.create_spec_file(root, "archive").get("ok", True))
+
+    def test_researcher_sees_archived_specs_as_prior_art(self):
+        """완료된 기능이야말로 새 기능과 충돌할 가능성이 가장 높다."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(tmp)
+            self._approve(root)
+            _run(root, "다른 기능", depth="deep")
+            ctx = _next(root, spec="다른-기능")["context"]
+            self.assertEqual([s["slug"] for s in ctx["archivedSpecs"]], ["테스트-기능"])
+
+    def test_approval_survives_a_missing_tasks_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(tmp)
+            spec_rel = _run(root, "테스트 기능")["next"]["context"]["specPath"]
+            _write_valid_spec(root, spec_rel)
+            _advance(root, {})
+            _advance(root, {"testResult": {"passed": 1, "failed": 0}})
+            (root / "specs" / "테스트-기능" / "tasks.md").unlink()
+            out = _advance(root, {"verdict": "approved"})
+            self.assertEqual(out["pipeline"]["status"], "done")
+            self.assertTrue((root / "specs" / "archive" / "테스트-기능"
+                             / "spec-v1.md").exists())
 
 
 if __name__ == "__main__":

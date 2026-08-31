@@ -25,6 +25,23 @@
 | `review` | `specsDir`·`srcDirs`·`testDirs` | `reviewsDir`(`.sdd/reviews`) |
 | `off` | (무동작) | — |
 
+`specs/archive/**`(완료된 명세)는 **어느 페이즈에서도 열려 있다.** 이 예외는
+`evaluate_gate` 안에 하드코딩되어 있다 — `alwaysWritable` 기본값에 넣는 것으로는 이미
+`config.json`이 있는 프로젝트에 닿지 않는다(`load_config`가 저장본으로 덮어쓴다).
+
+대가는 두 가지이고, 둘 다 그대로 적어 둔다.
+
+- 훅도 implement/review 중의 `specs/archive/**` 쓰기를 막지 않는다. 어떤 에이전트에게도
+  거기 쓰라고 시키지 않으므로 수용한다.
+- **이 예외가 아카이브 이동을 guard에서 완전히 지우지는 못한다.** 승인 시점의 이동은
+  커밋 전까지 `git status`에 `?? specs/archive/…`(예외로 걸러진다)와
+  `D specs/<slug>/spec-v<N>.md`(**걸러지지 않는다**)로 함께 남는다. 뒤쪽은 평범한
+  `specs/` 경로라, `enforce: true`에서 **다른** 파이프라인이 implement/review에 있으면
+  그 파이프라인의 `status`·리뷰 리포트 guard 절에 위반으로 잡힐 수 있다. 이동을 커밋하면
+  사라진다. 아카이빙 전에도 승인 시 `status: done`을 제자리에 쓰면 같은 자리가
+  `M specs/<slug>/spec-v<N>.md`로 똑같이 잡혔다 — 새로 생긴 부류가 아니라 경로가
+  늘어난 것이므로 우회 설계를 넣지 않는다.
+
 `evaluate_gate`는 `scripts/sdd.py`에 순수 함수로 구현되어 있고, 훅(`hooks/phase_gate.py`)과
 사후 탐지(`sdd.py guard`)가 이 함수를 그대로 재사용한다 — 규칙이 두 곳에서 따로 구현되지
 않는다.

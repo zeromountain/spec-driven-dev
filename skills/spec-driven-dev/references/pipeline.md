@@ -67,7 +67,7 @@
 | implement | `specChangeRequests` 있음 | `attempts.specRevision++`, **새 버전 명세**(v+1)를 만들며 → spec |
 | implement | `testResult.failed > 0` | `attempts.implement++`, 실패 내용을 넘겨 재호출. 상한 초과 시 halted |
 | implement | 테스트 통과 (또는 보고 없음) | → review |
-| review | `verdict: approved` | 명세 `status: done` 기록, `phase: off`, `status: done` |
+| review | `verdict: approved` | 명세·`tasks.md`의 남은 `- [ ]` 를 전부 채우고, `status: done` 기록, 디렉터리째 `specs/archive/<슬러그>/` 로 이동, `activeSpec` 해제, `phase: off`, `status: done` |
 | review | `verdict: changes-requested` | `attempts.review++`, `gaps`를 넘겨 → implement. 상한 초과 시 halted |
 | review | verdict 판독 불가 | halted |
 
@@ -100,13 +100,47 @@
 
 - `implement` 전환이 `blocked`면 파이프라인은 그 이유를 담아 **halted**가 된다. 게이트를
   끄고 지나가지 않는다.
-- 리뷰 승인 시 명세 프론트매터의 `status: done`을 써야 하는데 review 페이즈에서는 `specs/`
-  쓰기가 막힌다. `advance`는 이를 우회하지 않고 `phase: spec` → 기록 → `phase: off` 순으로
-  **정식 전환**을 거친다. 그래서 `guard`에도 위반으로 남지 않는다.
+- 리뷰 승인 시 명세 프론트매터의 `status: done`과 체크박스·디렉터리 이동을 써야 하는데
+  review 페이즈에서는 `specs/` 쓰기가 막힌다. `advance`는 이를 우회하지 않고
+  `phase: spec` → 기록 → `phase: off` 순으로 **정식 전환**을 거친다. 세 가지 쓰기가 모두
+  그 창 안에서 일어나고, 순서는 **체크 → `status` → 이동**이다 (앞의 둘은 같은 파일을
+  각자 읽고 쓰므로 순차여야 한다). 그래서 `guard`에도 위반으로 남지 않는다.
 - **워크트리를 가진 파이프라인은 전역 페이즈를 건드리지 않는다.** 전환 가능 여부는 그대로
   판정받지만(`blocked`면 halted) 상태에는 쓰지 않는다 — 페이즈는 프로젝트에 하나뿐이라
   격리된 쪽이 그걸 밀면 본체를 쓰는 파이프라인의 게이트 판정이 남의 단계로 바뀐다. 격리된
   파이프라인의 쓰기는 경로로 판정되므로 전역 페이즈가 필요 없다(`references/phase-gate.md`).
+
+## 완료 명세 아카이빙
+
+승인된 명세는 `specs/<슬러그>/` 에서 **`specs/archive/<슬러그>/` 로 디렉터리째** 옮겨진다
+(모든 버전과 `tasks.md` 가 함께 간다). 평탄화하지 않는 이유는 검증이 프론트매터의
+`feature` 와 부모 디렉터리 이름이 같기를 요구하기 때문이다.
+
+> **불변식: 살아 있는 파이프라인의 명세는 절대 아카이브에 없다.**
+
+그래서 같은 슬러그가 다시 살아나는 세 길목이 **모두 먼저 꺼낸다**:
+
+| 길목 | 언제 |
+|---|---|
+| `run "<같은 기능>"` / `--restart` | 새 파이프라인 레코드를 만든 직후, 로스터 판정 전 |
+| `run --from <단계>` (`reopen_pipeline`) | 단계 검증 직후, 로스터 판정과 `next` 전 |
+| `sdd.py new` (`create_spec_file`) | 슬러그 확정 직후, 버전 계산 전 |
+
+순서가 중요하다. 로스터는 명세 본문으로 깊이를 정하므로 명세가 없으면 조용히 `light` 로
+강등되고, `next` 는 리뷰 리포트를 만들면서 명세를 못 찾으면 파이프라인을 멈춘다.
+되돌릴 때는 `specPath`·`tasksPath` 도 함께 본체 경로로 고친다 — `reopen_pipeline` 은 그
+필드를 손대지 않으므로, 안 고치면 되열린 파이프라인이 아카이브 안의 파일을 계속 가리킨다.
+
+버전은 이어진다. 완료된 기능을 다시 열면 `spec-v1.md` 를 덮지 않고 `spec-v2.md` 가
+만들어진다. 아카이브가 비어 있지 않은 곳으로는 옮기지 않고, 되돌릴 때도 본체에 이미 있는
+파일은 **덮지 않는다** — 어느 쪽이든 실패하면 기록만 남기고 승인 판정은 그대로 간다.
+정리 작업이 판정을 뒤집으면 안 된다.
+
+`list`/`status` 는 아카이브를 `specs[]` 에서 빼고 **`archived[]`** 로 따로 준다.
+`spec-researcher` 는 `archivedSpecs` 로 그것을 받는다 — 완료된 기능이야말로 새 기능과
+충돌할 가능성이 가장 높아서, 아카이브됐다고 조사자 시야에서 지우면 안 된다.
+
+`archive` 는 예약된 슬러그다. `run`·`new` 둘 다 거절한다.
 
 ## 멱등성
 
@@ -234,6 +268,7 @@ sdd.py advance --spec 기능-b --result '<json>'
 | | 위치 | 왜 |
 |---|---|---|
 | `specs/<슬러그>/` | **본체** | 슬러그별로 갈라져 있어 충돌하지 않는다 — 게이트도 경로의 슬러그로 주인을 찾는다 |
+| `specs/archive/<슬러그>/` | **본체** | 완료된 명세. 어느 페이즈에서도 쓰기가 열려 있다 — 이동이 커밋 전까지 `git status` 에 남기 때문이다. 다만 삭제된 쪽(`D specs/<슬러그>/…`)까지 걸러지지는 않는다 (`references/phase-gate.md`) |
 | `.sdd/` (상태·리뷰) | **본체** | 상태가 흩어지면 재개가 깨진다 |
 
 `.sdd/state.json`은 워크트리를 써도 **공유 자원**이다. 그래서 상태를 고치는 경로는 전부

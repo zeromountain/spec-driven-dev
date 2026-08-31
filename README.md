@@ -150,6 +150,11 @@ codex --plugin-dir ~/spec-driven-dev              # Codex CLI
 생성, `tasks.md`, 리뷰 리포트 골격, 재시도 카운트, 승인 시 `status: done` 기록까지 전부
 스크립트 몫이라 오케스트레이터가 단계 사이에서 판단하지 않는다.
 
+승인은 문서를 실제 상태와 맞추고 정리까지 한다 — 명세와 `tasks.md`에 남은 `- [ ]`를 전부
+채우고, 디렉터리째 `specs/archive/<slug>/`로 옮긴다. 그래서 `specs/`를 열면 **지금 살아
+있는 기능만** 보인다. 아카이브는 삭제가 아니라서 같은 기능을 다시 열면(`run`,
+`run --from`) 자동으로 제자리로 돌아오고, 버전은 `spec-v2.md`로 이어진다.
+
 ```
 spec ──validate 통과──▶ implement ──테스트 통과──▶ review ──approved──▶ done
  ▲                          │                        │
@@ -197,6 +202,10 @@ Code에서만 동작한다 — Codex 플러그인은 훅을 지원하지 않으�
 | `spec` | `specs/`·`.sdd/`·`docs/`·`*.md` 밖 전부 | 항상 허용 목록, 임의의 `.md` |
 | `implement` | `specs/` 안 전부 | `specs/<slug>/tasks.md` |
 | `review` | `specs/`·`src/`·`tests/` | `.sdd/reviews/` |
+
+`specs/archive/`(완료된 명세)는 어느 페이즈에서도 열려 있다 — 승인 시점의 디렉터리 이동이
+커밋 전까지 `git diff`에 남기 때문이다. 삭제된 쪽까지 걸러지지는 않으니, 아카이빙 후에는
+커밋하는 편이 다른 파이프라인의 리포트를 깨끗하게 유지한다.
 
 플러그인 자체는 설치되면 모든 세션에 훅이 등록되지만, 프로젝트에 `.sdd/state.json`이
 없거나 `enforce`가 꺼져 있으면 완전히 무동작이다 — 다른 프로젝트에는 영향이 없다.

@@ -11,11 +11,14 @@ SDD 하네스는 하나의 책임을 페이즈 3개 × 역할 10개로 쪼갠다
 
 | 역할 | 쓰기 | 받는 것 | 내는 것 |
 |---|---|---|---|
-| `spec-researcher` | 없음 | 기능 설명, `sdd.py list` | `contextPack` |
+| `spec-researcher` | 없음 | 기능 설명, `sdd.py list`(진행 중 + `archivedSpecs`) | `contextPack` |
 | **`spec-architect`** | `specs/` | 기능 설명, 명세 경로, `contextPack`, `auditFindings` | 채워진 명세, `openQuestions` |
 | `spec-auditor` | 없음 | 명세 경로, `validate` JSON | `verdict`, `acFindings`, `missingErrorCases` |
 
 - **researcher는 제안하지 않는다** — "지금 이렇게 되어 있다"만 적는다. 설계는 아키텍트의 몫.
+- **아카이브는 삭제가 아니다** — 완료된 명세는 `specs/archive/<슬러그>/`로 옮겨지고
+  researcher에게 `archivedSpecs`로 전달된다. 새 기능과 충돌할 가능성이 가장 높은 것이
+  이미 만들어 놓은 기능이다. architect는 아카이브에 쓰지 않는다.
 - **architect는 조사하지 않는다**(깊은 모드에서) — 컨텍스트 팩에 없는 사실이 필요하면
   `openQuestions`로 돌린다. 요구사항을 지어내지 않는다.
 - **auditor는 고치지 않는다** — 결함과 제안 문장만 낸다. 수정은 아키텍트에게 되돌아간다.

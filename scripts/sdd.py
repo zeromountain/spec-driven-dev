@@ -128,6 +128,11 @@ PLACEHOLDER_RE = re.compile(r"\{\{[^{}\n]{1,120}\}\}")
 FENCE_RE = re.compile(r"^(\s*)(```|~~~)")
 SPEC_FILENAME_RE = re.compile(r"^spec-v(\d+)\.md$")
 
+# 완료된 명세는 <specsDir>/archive/<슬러그>/ 로 통째로 옮겨진다. 디렉터리 이름이 곧
+# 슬러그이므로(프론트매터 feature 와 대조된다) archive 는 슬러그가 될 수 없다.
+ARCHIVE_DIRNAME = "archive"
+RESERVED_SLUGS = frozenset({ARCHIVE_DIRNAME})
+
 SPECS_README = """# specs/
 
 이 디렉터리는 Spec-Driven Development의 소스 오브 트루스다. 각 기능은
@@ -137,6 +142,8 @@ SPECS_README = """# specs/
 - 명세는 8개 섹션을 모두 포함하고, 인수 기준은 `AC-1`부터, 오류 케이스는 `EC-1`부터
   연속된 ID를 갖는다.
 - 동작이 바뀌면 새 버전(`spec-v<N+1>.md`)을 만든다. 오탈자·명확화는 제자리에서 고친다.
+- 리뷰가 승인되면 남은 체크박스가 모두 채워지고 디렉터리째 `specs/archive/<slug>/`로
+  옮겨진다. 지운 것이 아니라 완료 기록이며, 같은 기능을 다시 열면 제자리로 돌아온다.
 
 전체 규칙(섹션 정의·ID 형식·검증 에러 목록·버저닝)은 `sdd` 플러그인의
 `skills/spec-driven-dev/references/spec-format.md`가 정본이다.
@@ -719,6 +726,13 @@ def evaluate_gate(phase: str, rel_path: str, config: dict):
         if matches_pattern(rel_path, pat):
             return None
 
+    # 완료된 명세가 사는 곳은 어느 페이즈에서도 열려 있다. 승인 시점의 디렉터리 이동이
+    # 커밋 전까지 `git status` 에 남아 **다른 파이프라인의** guard 위반으로 잡히는 것을
+    # 막는다. alwaysWritable 기본값에 넣는 것으로는 안 된다 — load_config 가
+    # cfg.update(stored) 를 하므로 이미 config.json 이 있는 프로젝트에 닿지 않는다.
+    if specs_dir and _under(rel_path, f"{specs_dir.strip('/')}/{ARCHIVE_DIRNAME}"):
+        return None
+
     if phase == "spec":
         if _under(rel_path, specs_dir):
             return None
@@ -860,6 +874,122 @@ def find_latest_version(specs_dir: Path, slug: str) -> int:
 
 
 # ---------------------------------------------------------------------------
+# 완료 명세 아카이빙
+# ---------------------------------------------------------------------------
+#
+# 불변식: **살아 있는 파이프라인의 명세는 절대 아카이브에 없다.** 승인(`_advance_review`)
+# 때 넣고, 같은 슬러그가 다시 살아날 때(`cmd_run` / `reopen_pipeline` / `create_spec_file`)
+# 되돌린다. 이 하나가 낡은 `specPath`, `find_latest_version`이 0을 돌려줘 v1부터 다시
+# 시작하는 것, 새 v1이 아카이브된 v1과 충돌하는 것을 동시에 없앤다. 그래서
+# `find_latest_version`은 아카이브를 보지 않아도 된다 — 보게 만들면 그 값으로 본체 경로를
+# 곧바로 read_text 하는 세 곳(depth_for_slug·transition_phase·list_specs)이 죽는다.
+
+
+def archive_paths(root: Path, slug: str, config: dict):
+    """(본체 디렉터리, 아카이브 디렉터리)."""
+    specs_dir = root / config["specsDir"]
+    return specs_dir / slug, specs_dir / ARCHIVE_DIRNAME / slug
+
+
+def _rel(root: Path, p: Path) -> str:
+    return str(p.relative_to(root))
+
+
+def _move_dir(src: Path, dst: Path) -> dict:
+    """디렉터리를 통째로 옮긴다. rename 한 번이라 양쪽에 동시에 있는 창이 없다.
+
+    shutil.move는 쓰지 않는다 — rename이 실패하면 copytree+rmtree로 폴백해 긴 비원자적
+    창을 만들고, 파일시스템이 달라도 조용히 성공해 잘못 설정된 specsDir를 가린다."""
+    if not src.exists():
+        return {"moved": False, "reason": f"'{src.name}' 디렉터리가 없다"}
+    if dst.exists() and any(dst.iterdir()):
+        return {"moved": False, "reason": f"'{dst}' 가 이미 비어 있지 않다"}
+    try:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if dst.exists():
+            dst.rmdir()          # 비어 있는 디렉터리만 여기 온다
+        src.rename(dst)
+    except OSError as e:
+        return {"moved": False, "reason": f"이동 실패: {e}"}
+    return {"moved": True}
+
+
+def _repoint(root: Path, pipe: dict, old_dir: Path, new_dir: Path):
+    """디렉터리가 옮겨졌으니 파이프라인이 들고 있는 파일 경로도 따라 옮긴다."""
+    for key in ("specPath", "tasksPath"):
+        rel = pipe.get(key)
+        if not rel:
+            continue
+        try:
+            name = Path(rel).relative_to(_rel(root, old_dir))
+        except ValueError:
+            continue
+        pipe[key] = _rel(root, new_dir / name)
+
+
+def archive_spec_dir(root: Path, pipe: dict, config=None) -> dict:
+    """완료된 명세 디렉터리를 <specsDir>/archive/<슬러그>/ 로 옮긴다.
+
+    실패해도 승인된 파이프라인을 멈추지 않는다 — 정리 작업이 판정을 뒤집으면 안 된다."""
+    config = config or load_config(root)
+    live, arch = archive_paths(root, pipe["slug"], config)
+    moved = _move_dir(live, arch)
+    if not moved["moved"]:
+        return {"archived": False, "reason": moved["reason"]}
+    _repoint(root, pipe, live, arch)
+    pipe["archived"] = True
+    pipe["archivedAt"] = now_iso()
+    return {"archived": True, "dir": _rel(root, arch),
+            "specPath": pipe.get("specPath"), "tasksPath": pipe.get("tasksPath")}
+
+
+def unarchive_spec_dir(root: Path, slug: str, config=None) -> dict:
+    """아카이브에 있으면 <specsDir>/<슬러그>/ 로 되돌린다. 멱등이다.
+
+    본체에 이미 내용이 있으면 **없는 파일만** 채우고 절대 덮어쓰지 않는다 — 아카이브본이
+    살아 있는 작업물을 덮는 것이 이 기능에서 가장 나쁜 결과다."""
+    config = config or load_config(root)
+    live, arch = archive_paths(root, slug, config)
+    if not arch.exists():
+        return {"restored": False, "reason": "아카이브에 없다"}
+
+    if live.exists() and any(live.iterdir()):
+        restored, skipped = [], []
+        for f in sorted(arch.iterdir()):
+            target = live / f.name
+            if target.exists():
+                skipped.append(f.name)
+                continue
+            f.rename(target)
+            restored.append(f.name)
+        if not skipped:
+            arch.rmdir()
+        return {"restored": bool(restored), "dir": _rel(root, live),
+                "files": restored, "skipped": skipped,
+                "reason": (f"본체에 이미 있어 건너뛴 파일: {', '.join(skipped)}"
+                           if skipped else None)}
+
+    moved = _move_dir(arch, live)
+    if not moved["moved"]:
+        return {"restored": False, "reason": moved["reason"]}
+    return {"restored": True, "dir": _rel(root, live)}
+
+
+def restore_spec_dir(root: Path, pipe: dict, config=None) -> dict:
+    """되살아나는 파이프라인의 명세를 꺼내고 specPath·tasksPath 도 함께 되돌린다.
+
+    `reopen_pipeline`은 이 필드들을 손대지 않으므로, 경로를 안 되돌리면 되열린
+    파이프라인이 아카이브 안의 파일을 계속 가리킨다."""
+    config = config or load_config(root)
+    live, arch = archive_paths(root, pipe["slug"], config)
+    out = unarchive_spec_dir(root, pipe["slug"], config)
+    if out.get("restored"):
+        _repoint(root, pipe, arch, live)
+    pipe["archived"] = False
+    return out
+
+
+# ---------------------------------------------------------------------------
 # AGENTS.md 병합
 # ---------------------------------------------------------------------------
 
@@ -977,6 +1107,12 @@ def create_spec_file(root: Path, feature: str, slug=None) -> dict:
     config = load_config(root)
     specs_dir = root / config["specsDir"]
     slug = slugify(slug) if slug else slugify(feature)
+    if slug in RESERVED_SLUGS:
+        return {"ok": False, "reason": f"'{slug}' 는 예약된 슬러그다 — "
+                                       f"완료된 명세가 사는 디렉터리 이름이라 쓸 수 없다"}
+    # 파이프라인 없이 `sdd.py new` 만 직접 부르는 경로를 덮는다. 먼저 꺼내야
+    # find_latest_version 이 N 을 찾아 N+1 을 만든다 (아카이브본과 v1 이 충돌하지 않는다).
+    unarchive_spec_dir(root, slug, config)
     version = find_latest_version(specs_dir, slug) + 1
     feature_dir = specs_dir / slug
     feature_dir.mkdir(parents=True, exist_ok=True)
@@ -1170,6 +1306,8 @@ def list_specs(root: Path) -> dict:
     if specs_dir.exists():
         for feature_dir in sorted(p for p in specs_dir.iterdir() if p.is_dir()):
             slug = feature_dir.name
+            if slug == ARCHIVE_DIRNAME:
+                continue          # 완료된 명세는 archived[] 로 따로 나간다
             latest = find_latest_version(specs_dir, slug)
             if latest == 0:
                 continue
@@ -1189,7 +1327,27 @@ def list_specs(root: Path) -> dict:
                 "warningCount": len(v["warnings"]),
                 "reviewCount": len(reviews),
             })
-    return {"specs": items}
+
+    # 아카이브는 숨기되 잃지는 않는다 — spec-researcher 에게 선행 사례로 넘어간다.
+    archived = []
+    archive_root = specs_dir / ARCHIVE_DIRNAME
+    if archive_root.exists():
+        for feature_dir in sorted(p for p in archive_root.iterdir() if p.is_dir()):
+            slug = feature_dir.name
+            latest = find_latest_version(archive_root, slug)
+            if latest == 0:
+                continue
+            spec_path = feature_dir / f"spec-v{latest}.md"
+            # 검증은 다시 돌리지 않는다 — 완료된 명세는 판정 대상이 아니다.
+            fm, _ = parse_frontmatter(spec_path.read_text(encoding="utf-8"))
+            archived.append({
+                "slug": slug,
+                "version": latest,
+                "path": str(spec_path.relative_to(root)),
+                "status": (fm or {}).get("status", "unknown"),
+            })
+
+    return {"specs": items, "archived": archived}
 
 
 def cmd_list(args) -> dict:
@@ -1224,6 +1382,7 @@ def cmd_status(args) -> dict:
         "activeSpec": state.get("activeSpec"),
         "depth": state.get("depth", DEFAULT_STATE["depth"]),
         "specs": listing["specs"],
+        "archived": listing["archived"],
         "guardViolations": violations,
         "pipeline": pipeline_summary(pipes.get(
             resolve_pipeline_slug(state, allow_active=True) or "")),
@@ -1701,6 +1860,54 @@ def _advance_agent(pipe: dict) -> bool:
     return True
 
 
+TODO_BOX_RE = re.compile(r"^(\s*[-*]\s*)\[ \](\s|$)")
+
+
+def tick_all_checkboxes(path) -> int:
+    """마크다운에 남은 `- [ ]` 를 전부 `- [x]` 로 채운다. 바꾼 줄 수를 돌려준다.
+
+    `set_spec_status`와 같은 성격의 줄 단위 수술이다. **이미 있는 체크박스만** 채운다 —
+    없는 줄에 체크박스를 새로 붙이면 `EC_LINE_RE`의 부정 전방탐색 때문에 그 줄이 오류
+    케이스로 인정되지 않고, 검증 실패가 다음 implement 전환을 막는다. 반대 방향인
+    `[ ]` → `[x]` 는 여전히 그 전방탐색에 걸리므로 어떤 불릿도 분류가 바뀌지 않는다.
+
+    `strip_code_fences`는 펜스 본문을 지운 *변형된* 문자열을 주므로 되쓸 수 없다.
+    같은 상태 기계를 돌되 원본 줄을 그대로 내보낸다."""
+    path = Path(path)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return 0
+
+    # 프론트매터는 건드리지 않는다.
+    head_end = 0
+    if text.startswith("---\n"):
+        end = text.find("\n---", 4)
+        if end != -1:
+            nl = text.find("\n", end + 1)
+            head_end = len(text) if nl == -1 else nl + 1
+
+    head, body = text[:head_end], text[head_end:]
+    out, fence, changed = [], None, 0
+    for line in body.splitlines(keepends=True):
+        m = FENCE_RE.match(line)
+        if fence is None:
+            if m:
+                fence = m.group(2)
+            else:
+                new = TODO_BOX_RE.sub(r"\1[x]\2", line, count=1)
+                if new != line:
+                    changed += 1
+                    line = new
+        elif m and m.group(2) == fence:
+            fence = None
+        out.append(line)
+
+    if changed:
+        path.write_text(head + "".join(out), encoding="utf-8")
+    return changed
+
+
 def set_spec_status(spec_path: Path, status: str) -> bool:
     """명세 프론트매터의 status만 바꾼다 (본문은 건드리지 않는다)."""
     text = spec_path.read_text(encoding="utf-8")
@@ -2049,6 +2256,10 @@ def _next_spec(root: Path, pipe: dict) -> dict:
 
     if not pipe.get("specPath"):
         created = create_spec_file(root, pipe["feature"], pipe["slug"])
+        if not created.get("path"):
+            _halt(pipe, "명세 파일을 만들지 못했다: " + str(created.get("reason")))
+            _persist_pipeline(root, pipe)
+            return compute_next(root)
         pipe["specPath"] = created["path"]
         pipe["specVersion"] = created["version"]
         _record(pipe, "spec-created", path=created["path"], version=created["version"])
@@ -2073,9 +2284,13 @@ def _next_spec(root: Path, pipe: dict) -> dict:
     }
     agent = current_agent(pipe)
     if agent == "spec-researcher":
+        listing = list_specs(root)
         context = {"feature": pipe["feature"], "slug": pipe["slug"],
                    "specsDir": config["specsDir"],
-                   "existingSpecs": list_specs(root)["specs"]}
+                   "existingSpecs": listing["specs"],
+                   # 완료된 기능이야말로 새 기능과 충돌할 가능성이 가장 높다 —
+                   # 아카이브됐다고 조사자 시야에서 지우면 안 된다.
+                   "archivedSpecs": listing["archived"]}
         instruction = ("명세를 쓰기 전에 필요한 사실을 모아라. 제안하지 말고 "
                        "'지금 이렇게 되어 있다'만 적는다. 아무 파일도 쓰지 마라.")
     elif agent == "spec-auditor":
@@ -2531,16 +2746,31 @@ def _advance_review(root: Path, pipe: dict, result: dict) -> None:
     verdict = str(result.get("verdict") or "").strip().lower()
 
     if verdict == "approved":
+        config = load_config(root)
         spec_path = root / pipe["specPath"]
-        # status를 쓰려면 specs/ 쓰기가 열려 있어야 한다. 게이트를 우회하는 대신
-        # 정식으로 spec 페이즈로 되돌린 뒤 고치고 off로 닫는다.
+        tasks_path = root / pipe["tasksPath"] if pipe.get("tasksPath") else None
+        # 명세 본문·tasks.md·디렉터리 위치를 모두 쓰려면 specs/ 쓰기가 열려 있어야 한다.
+        # 게이트를 우회하는 대신 정식으로 spec 페이즈로 되돌린 뒤 고치고 off로 닫는다.
         apply_phase = not is_isolated(root, pipe)
         transition_phase(root, "spec", pipe["slug"], apply=apply_phase)
+        # 순서: 체크 → status → 이동. 앞의 둘은 같은 파일을 각자 read-then-write 하므로
+        # 순차여야 하고, set_spec_status 가 이미 체크된 본문을 읽어야 한다. 이동은 문서
+        # 수정이 끝난 뒤여야 경로를 한 번만 다룬다.
+        ticked = tick_all_checkboxes(spec_path)
+        if tasks_path:
+            ticked += tick_all_checkboxes(tasks_path)
         ok = set_spec_status(spec_path, "done") if spec_path.exists() else False
+        arch = archive_spec_dir(root, pipe, config)
         transition_phase(root, "off", pipe["slug"], apply=apply_phase)
+        # 완료된 슬러그가 activeSpec 으로 남으면 나중에 --spec 없는 `phase implement` 가
+        # 그걸 폴백으로 집어 "spec 를 찾을 수 없다"로 막힌다.
+        if apply_phase:
+            update_state(root, lambda st: st.update({"activeSpec": None}))
         pipe["status"] = "done"
         pipe["stage"] = "done"
-        _record(pipe, "approved", specStatusUpdated=ok, reviewPath=pipe.get("reviewPath"))
+        _record(pipe, "approved", specStatusUpdated=ok, ticked=ticked,
+                archived=arch["archived"], archivePath=arch.get("dir"),
+                archiveSkipped=arch.get("reason"), reviewPath=pipe.get("reviewPath"))
         return
 
     if verdict == "changes-requested":
@@ -2569,6 +2799,11 @@ def reopen_pipeline(root: Path, pipe: dict, stage: str, depth=None) -> dict:
     만들어 명세 버전을 올려 버리므로 이 용도에 맞지 않는다."""
     if stage not in PIPELINE_STAGES:
         return {"ok": False, "reason": f"알 수 없는 단계: {stage}"}
+
+    # 살아나는 파이프라인의 명세는 아카이브에 있으면 안 된다. 아래 refresh_roster 는
+    # 명세 본문으로 깊이를 정하고(없으면 조용히 light 로 강등된다), compute_next 는
+    # build_review_report 를 부르는데 명세를 못 찾으면 파이프라인을 멈춘다.
+    restored = restore_spec_dir(root, pipe)
 
     was = {"stage": pipe.get("stage"), "status": pipe.get("status")}
     pipe["status"] = "running"
@@ -2599,7 +2834,10 @@ def reopen_pipeline(root: Path, pipe: dict, stage: str, depth=None) -> dict:
            "stage": stage, "depth": d["depth"], "deepReasons": d["deepReasons"],
            "forcedDepth": pipe.get("forcedDepth"),
            "rosterBefore": before, "roster": d["agents"][stage],
+           "specPath": pipe.get("specPath"),
            "next": compute_next(root, pipe["slug"])}
+    if restored.get("restored"):
+        out["restored"] = restored
     # 예전에 걸어둔 --depth 가 남아 임계값을 덮고 있으면 조용히 넘어가지 않는다.
     if pipe.get("forcedDepth") and d["deepReasons"] and d["depth"] == "light":
         out["warning"] = (
@@ -2676,6 +2914,11 @@ def cmd_run(args) -> dict:
     slug = slugify(args.slug) if getattr(args, "slug", None) else (
         slugify(feature) if feature else None)
     target = explicit or slug or resolve_pipeline_slug(state, allow_active=True)
+    if target in RESERVED_SLUGS:
+        return {"ok": False,
+                "reason": f"'{target}' 는 예약된 슬러그다 — 완료된 명세가 사는 "
+                          "디렉터리 이름이라 기능 슬러그로 쓸 수 없다. `--slug` 로 "
+                          "다른 이름을 주거나 기능 설명을 바꿔라"}
     pipe = pipes.get(target)
     resumable = pipe and pipe.get("status") in ("running", "awaiting-user", "halted")
 
@@ -2724,6 +2967,10 @@ def cmd_run(args) -> dict:
     pipe["forcedDepth"] = getattr(args, "depth", None)
 
     config = load_config(root)
+    # 같은 슬러그를 다시 여는 길이다. 아래 refresh_roster 보다 먼저 꺼내야 깊이가
+    # 명세 본문으로 판정된다. 레코드는 방금 만든 빈 것이라 되돌릴 포인터가 없다 —
+    # specPath 는 뒤이어 _next_spec 의 create_spec_file 이 채운다.
+    unarchive_spec_dir(root, slug, config)
     want_wt = getattr(args, "worktree", None)
     if want_wt is None:
         want_wt = bool(config.get("worktrees"))

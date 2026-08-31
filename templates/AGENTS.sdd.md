@@ -35,6 +35,10 @@ Security Reviewer(입력 검증·인가·시크릿) · Performance Reviewer(N+1�
 새 명세는 `sdd.py new`가 템플릿에서 만들어 주며, 안에는 `{{...}}` 플레이스홀더가 들어
 있다. **하나라도 남아 있으면 검증에 실패하고 구현 단계로 넘어갈 수 없다.**
 
+리뷰가 승인되면 남은 체크박스가 모두 채워지고 명세 디렉터리가 `specs/archive/<slug>/`로
+옮겨진다. 손으로 체크하거나 옮기지 않는다 — 같은 기능을 다시 열면 제자리로 돌아오고
+버전이 이어진다.
+
 전체 규칙(프론트매터·ID 형식·검증 에러 목록·버저닝)은 `sdd` 플러그인의
 `skills/spec-driven-dev/references/spec-format.md`가 정본이다.
 
