@@ -68,8 +68,11 @@ tools: Read, Grep, Glob, Bash
 
 ## 입력 방식
 
-오케스트레이터가 "명세 경로 + `sdd.py validate` JSON 출력 + (있으면) `spec-researcher`의
-컨텍스트 팩"을 프롬프트로 준다.
+오케스트레이터가 "명세 경로 + (있으면) `spec-researcher`의 컨텍스트 팩"을 프롬프트로 준다.
+**`sdd.py validate`의 JSON 출력은 컨텍스트로 넘어오지 않는다** — 이 단계에 오는 명세는
+이미 구조 검증을 통과한 뒤이므로, 그 결과를 다시 실어 보내는 대신 필요하면 네가 `Bash`로
+`sdd.py validate <spec-path>`를 직접 돌린다(점검 항목 7번). 쓰기 도구가 없어도 `Bash`가
+있는 이유가 이것이다.
 
 ## 출력 방식
 

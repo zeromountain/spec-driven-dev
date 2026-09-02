@@ -50,6 +50,7 @@ tools: Read, Grep, Glob, Bash
 
 ```json
 {
+  "agent": "code-reviewer",
   "specPath": "specs/<slug>/spec-v<N>.md",
   "verdict": "approved",
   "findings": [

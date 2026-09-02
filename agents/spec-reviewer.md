@@ -48,6 +48,7 @@ tools: Read, Grep, Glob, Bash
 
 ```json
 {
+  "agent": "spec-reviewer",
   "specPath": "specs/<slug>/spec-v<N>.md",
   "verdict": "approved",
   "acFindings": [{"ac": "AC-1", "implemented": true, "tested": true, "note": "..."}],
@@ -88,5 +89,7 @@ tools: Read, Grep, Glob, Bash
 
 ## 출력 방식
 
-리뷰를 마친 뒤 리포트 본문(마크다운)과 위 출력 스키마 JSON을 함께 반환한다. 리포트 저장은
+리뷰를 마친 뒤 리포트 본문(마크다운)과 위 출력 스키마 JSON을 함께 반환한다.
+**JSON에 `"agent": "spec-reviewer"`를 반드시 포함한다** — 로스터가 둘 이상일 때
+오케스트레이터가 여러 리뷰어의 판정을 구분하는 유일한 단서다. 리포트 저장은
 오케스트레이터가 `.sdd/reviews/`에 한다.
