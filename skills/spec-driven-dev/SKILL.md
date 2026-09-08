@@ -112,7 +112,20 @@ Codex에서의 진입점이다.
 **워크트리는 Codex에서도 그대로 동작한다**(git만 있으면 된다). 다만 얻는 것이 하나 줄어든다 —
 파일 격리는 그대로지만, "훅이 파이프라인별로 판정한다"는 이점은 훅이 없으니 해당 없다.
 
+**Orca 위에서 돌 때:** Orca가 호스팅하는 세션은 Claude Code 서브에이전트를 그대로 쓸 수
+있다 — 위 표의 Claude Code 열이 변경 없이 그대로 적용된다. 새 분기를 만들지 않는다.
+
+**herdr 위에서 돌 때는 이 절 전체가 적용되지 않는다.** herdr는 자기 오케스트레이션
+프리미티브로 "지금 어디인지"를 관리하고, `sdd.py`의 파이프라인 레지스트리
+(`run`/`next`/`advance`/`board`/`abort`)를 쓰지 않는다 — 아래 워크플로 절을 따르지 말고
+**`references/herdr-workflow.md`를 먼저 읽는다.** `validate`/`depth`/`trace`/`guard`/
+`phase`/`new`/`tasks`/`review-report` 같은 stateless 판정 명령만 그대로 재사용한다.
+
 ## 워크플로
+
+**herdr 위에서는 이 절을 건너뛴다** — `references/herdr-workflow.md`가 이 절 전체를
+대체한다. 아래는 Claude Code·Codex·Orca(=Claude Code) 세 호스트에서 파이프라인
+레지스트리를 쓰는 경로다.
 
 ### 준비: 스크립트 경로 확인 (세션당 한 번)
 
@@ -299,6 +312,8 @@ $S/sdd.py run --spec <슬러그> --from review --path <root>   # 명세·구현�
 - `references/spec-format.md` — 8섹션 정의, AC-N 규약, 버저닝 규칙
 - `references/phase-gate.md` — 훅 동작, 페이즈별 deny 표, 탈출구, Bash 미커버 이유
 - `references/templates.md` — 스캐폴딩 산출물 전문과 최종 디렉터리 구조
+- `references/herdr-workflow.md` — herdr 전용: 파이프라인 레지스트리 대신 herdr 고유
+  오케스트레이션으로 SDD 원칙을 지키는 워크플로
 
 ## 하지 않을 것
 
