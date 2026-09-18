@@ -70,4 +70,4 @@ tools: Read, Grep, Glob, Edit, Bash
 ## 출력 방식
 
 `tasks.md`를 채운 뒤 위 출력 스키마 JSON 하나만 마지막 메시지로 반환한다. 오케스트레이터는
-이 JSON을 `software-engineer`와 `test-engineer` 양쪽 프롬프트에 그대로 싣는다.
+이 JSON을 `software-engineer` 프롬프트에 그대로 싣는다.

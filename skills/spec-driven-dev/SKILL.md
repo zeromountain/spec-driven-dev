@@ -1,6 +1,6 @@
 ---
 name: spec-driven-dev
-description: 명세를 소스 오브 트루스로 삼는 Spec-Driven Development(SDD) 하네스를 설정하고 운영한다. "SDD 시작해줘", "명세부터 만들자", "spec-driven으로 개발하자", "AGENTS.md에 SDD 규약 걸어줘" 같은 요청, 또는 이미 SDD가 설정된 프로젝트에서 "명세 써줘", "이 기능 구현해줘"(명세 기반으로), "리뷰해줘"(명세 대조), "지금 페이즈가 뭐야" 같은 요청에 쓴다. SDD 프로젝트에서 중단된 작업을 이어가려는 요청("이어서 해줘", "아까 하던 거 계속", "어디까지 했지")에도 쓴다 — 진행 위치가 .sdd/state.json에 남아 있어 컨텍스트 없이도 재개된다. 단순 코드 작성/버그 수정처럼 명세 없이 바로 구현하면 되는 요청에는 쓰지 않는다 — 그건 일반 개발 워크플로의 영역이다.
+description: 명세를 소스 오브 트루스로 삼는 Spec-Driven Development(SDD) 하네스를 설정하고 운영한다. "SDD 시작해줘", "명세부터 만들자", "spec-driven으로 개발하자", "AGENTS.md에 SDD 규약 걸어줘" 같은 요청, 또는 이미 SDD가 설정된 프로젝트에서 "명세 써줘", "이 기능 구현해줘"(명세 기반으로), "리뷰해줘"(코드 품질·보안·성능 검토), "지금 페이즈가 뭐야" 같은 요청에 쓴다. SDD 프로젝트에서 중단된 작업을 이어가려는 요청("이어서 해줘", "아까 하던 거 계속", "어디까지 했지")에도 쓴다 — 진행 위치가 .sdd/state.json에 남아 있어 컨텍스트 없이도 재개된다. 단순 코드 작성/버그 수정처럼 명세 없이 바로 구현하면 되는 요청에는 쓰지 않는다 — 그건 일반 개발 워크플로의 영역이다.
 ---
 
 # Spec-Driven Development (spec-driven-dev)
@@ -27,11 +27,11 @@ PreToolUse 훅이 페이즈 경계를 실제로 막는다. 진행 위치와 **�
    차례"라고 네가 판단하지 않는다 — `next`가 시키는 행동 하나만 하고 `advance`로 결과를
    넘긴다. 진행 위치는 대화가 아니라 `.sdd/state.json`의 `pipeline`에 있으므로, 어디까지
    했는지 사용자에게 되묻지 않는다.
-5. **역할 경계를 존중한다.** Spec Architect는 `specs/`만, Software Engineer는 `src/`만,
-   Test Engineer는 `tests/`만, Impl Planner는 `tasks.md`만, 리서처·감사자·리뷰어는 쓰기
-   자체를 하지 않는다. **같은 페이즈 안의 경계는 훅이 막지 못한다** — 특히 깊은 모드에서
-   `software-engineer`가 테스트를 쓰거나 `test-engineer`가 구현을 고치는 것은 통과된다.
-   `next`의 `instruction`에 그 금지가 담겨 있으니 **줄여서 전달하지 마라.**
+5. **역할 경계를 존중한다.** Spec Architect는 `specs/`만, Software Engineer는 `src/`·
+   `tests/`를, Impl Planner는 `tasks.md`만 쓴다. 감사자·리뷰어는 쓰기 자체를 하지 않는다.
+   **같은 페이즈 안의 경계는 훅이 막지 못한다** — 특히 impl-planner가 `tasks.md` 밖의
+   `specs/` 파일을 고치는 것은 통과된다. `next`의 `instruction`에 그 금지가 담겨 있으니
+   **줄여서 전달하지 마라.**
 6. **기능은 리뷰 승인 후에만 완료다.** 리뷰어가 여럿일 때 **하나라도
    `changes-requested`면 전체가 `changes-requested`다** — 평균 내지 않는다. 종합은
    `advance`가 하므로 네가 판정을 합치지 않는다.
@@ -39,18 +39,14 @@ PreToolUse 훅이 페이즈 경계를 실제로 막는다. 진행 위치와 **�
    우회해 쓰지 않는다. 파이프라인 안에서는 `next`가 정식 전환을 이미 하며, 전환이 막히면
    `halted`로 그 이유를 그대로 보고한다. 게이트를 끄는 것은 사용자의 `/sdd:phase off`뿐이다.
 
-## 서브에이전트 10종
+## 서브에이전트 6종
 
 | 페이즈 | 에이전트 | 하는 일 | 쓰기 |
 |---|---|---|---|
-| spec | `spec-researcher` | 기존 코드·명세·용어 조사 → 컨텍스트 팩 | 없음 |
-| spec | **`spec-architect`** | 8섹션 명세 작성 | `specs/` |
-| spec | `spec-auditor` | 명세를 적대적으로 검토 (검증 가능성·모순·누락 EC) | 없음 |
+| spec | **`spec-architect`** | 조사(기존 코드·명세) + 8섹션 명세 작성 + 스스로 적대적 재검토 | `specs/` |
 | implement | `impl-planner` | AC → 태스크 분해, 영향 파일·패턴·순서 확정 | `tasks.md` |
-| implement | **`software-engineer`** | 구현 | `src/` |
-| implement | `test-engineer` | AC별 테스트 작성·실행 | `tests/` |
-| review | **`spec-reviewer`** | 명세 준수·AC 커버리지·스펙 밖 구현 | 없음 |
-| review | `code-reviewer` | 가독성·복잡도·중복·에러 처리 | 없음 |
+| implement | **`software-engineer`** | 구현 + AC별 테스트 작성·실행 | `src/`, `tests/` |
+| review | **`code-reviewer`** | 가독성·복잡도·중복·에러 처리 | 없음 |
 | review | `security-reviewer` | 입력 검증·인가·시크릿·인젝션 | 없음 |
 | review | `perf-reviewer` | N+1·복잡도·재계산·경계 없는 로딩 | 없음 |
 
@@ -58,9 +54,14 @@ PreToolUse 훅이 페이즈 경계를 실제로 막는다. 진행 위치와 **�
 정하지 않는다** — `next` 응답의 `agent`(또는 `agents`)가 그대로 답이다. `roster`와
 `rosterPosition`으로 지금 단계의 몇 번째인지도 함께 온다.
 
+**명세 준수·AC 커버리지·스펙 밖 구현을 전담 판정하는 리뷰어는 없다** — `code-reviewer`가
+review 단계의 유일한 기본값이고, 나머지 둘은 신호가 있을 때만 붙는다. `trace`/`guard`가
+계산한 커버리지·게이트 위반 표는 리포트에 실리지만, 그걸 근거로 승인/반려를 판정하는
+사람은 없다는 뜻이다.
+
 깊이 판정 근거는 인수 기준 개수(8개 이상)·오류 케이스 개수(5개 이상)·검증 경고 수(3개
 이상)와 명세 본문의 보안·성능 키워드다. `run` 응답의 `depth.deepReasons`를 사용자에게
-한 줄로 알린다 — 깊은 모드는 한 번의 `/sdd:run`이 최대 10개 서브에이전트를 부르므로,
+한 줄로 알린다 — 깊은 모드는 한 번의 `/sdd:run`이 최대 6개 서브에이전트를 부르므로,
 근거 없이 에이전트 수가 바뀌면 비용을 예측할 수 없다. 사용자가 직접 정하려면
 `/sdd:run <설명> --deep` 또는 `--light`다(파이프라인 내내 유지된다).
 
@@ -83,7 +84,6 @@ Codex에서의 진입점이다.
 | board | `/sdd:board` | "지금 뭐뭐 돌고 있어" | 살아 있는 파이프라인 전부의 위치·실행 가능 여부 |
 | worktree | `/sdd:worktree <list\|status\|add\|remove>` | "워크트리 정리해줘" | 기능별 워크트리 조회·생성·정리 |
 | spec / implement / review | `/sdd:spec` 등 | "명세만 / 구현만 / 리뷰만" | 루프를 **한 번만** 돌린다 (수동 스텝) |
-| audit | `/sdd:audit [슬러그]` | "명세 좀 봐줘" | `spec-auditor`만 단독 호출 (파이프라인 밖) |
 | status | `/sdd:status` | "지금 어디까지 했지" | `sdd.py status` JSON을 표로 렌더 |
 | phase | `/sdd:phase <spec\|implement\|review\|off>` | "게이트 잠깐 꺼줘" | 수동 전환 (평소엔 불필요) |
 
@@ -94,15 +94,16 @@ Codex에서의 진입점이다.
 
 | | Claude Code | Codex CLI |
 |---|---|---|
-| 10개 역할 | 서브에이전트가 각자 **독립된 컨텍스트**에서 | 이 스킬 하나가 **순서대로 직접** 수행 |
+| 6개 역할 | 서브에이전트가 각자 **독립된 컨텍스트**에서 | 이 스킬 하나가 **순서대로 직접** 수행 |
 | 리뷰어 동시 호출 | 진짜 병렬, 서로의 판정을 못 봄 | 한 컨텍스트 안 — 순차적 자기 점검에 가깝다 |
 | 페이즈 게이트 | PreToolUse 훅이 실제로 차단 | **훅 없음** — `sdd.py guard`로 사후 점검 |
 | 파이프라인·깊이·스케줄러·워크트리 | 동일 | 동일 (전부 `sdd.py`) |
 
 **Codex에서 역할을 수행할 때:** 서브에이전트가 없으므로 `next`가 지정한 `agent`의 프롬프트를
 네가 직접 맡는다. `agents/<이름>.md`는 Codex에 설치되지 않으니, 역할의 책임·금지 사항은
-`references/roles.md`를 근거로 삼는다. 특히 **구현자 역할과 테스트 작성자 역할을 한
-호흡에 섞지 마라** — 순차로 하더라도 명세를 먼저 읽고 기대값을 정한 뒤 구현을 본다.
+`references/roles.md`를 근거로 삼는다. `software-engineer` 역할을 수행할 때는 **구현과
+테스트를 한 호흡에 섞지 마라** — AC마다 테스트를 먼저 쓰고 실패를 확인한 뒤에 구현을
+본다(빨강→초록). 명세를 먼저 읽고 기대값을 인수 기준 문장에서 뽑는다.
 
 **Codex에서 `enforce`는 무의미하다.** 훅이 없어 아무것도 막히지 않는데, `schedule()`은
 `enforce: true`를 보고 같은 페이즈끼리만 동시에 돌린다. Codex 전용 프로젝트라면
@@ -307,7 +308,7 @@ $S/sdd.py run --spec <슬러그> --from review --path <root>   # 명세·구현�
 ## 참조 파일
 
 - `references/pipeline.md` — 상태머신 전이표, `next`/`advance` 계약, 중단 사유별 대처
-- `references/roles.md` — 10개 역할의 책임·금지 사항·인계 관계
+- `references/roles.md` — 6개 역할의 책임·금지 사항·인계 관계
 - `references/depth.md` — light/deep 판정 규칙, 임계값, 신호 키워드
 - `references/spec-format.md` — 8섹션 정의, AC-N 규약, 버저닝 규칙
 - `references/phase-gate.md` — 훅 동작, 페이즈별 deny 표, 탈출구, Bash 미커버 이유

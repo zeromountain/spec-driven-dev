@@ -7,18 +7,30 @@ repository.
 
 A standalone Claude Code plugin (also a self-hosted marketplace, following the same layout as
 `zeromountain/auto-dev`). It ships a single plugin, `sdd`, that scaffolds and runs a
-Spec-Driven Development harness in any target project: specs as the source of truth, ten
+Spec-Driven Development harness in any target project: specs as the source of truth, six
 role-bound subagents across three phases, a registry of pipeline state machines in `sdd.py` (one per
 feature, running concurrently) that decides the next action and what may run at the same time, and an opt-in PreToolUse hook that enforces each *phase's* write boundaries
 by file path.
 
-The ten agents, by phase (bold = also runs in light mode):
+The six agents, by phase (bold = also runs in light mode):
 
 | phase | agents |
 |---|---|
-| spec | `spec-researcher`, **`spec-architect`**, `spec-auditor` |
-| implement | `impl-planner`, **`software-engineer`**, `test-engineer` |
-| review | **`spec-reviewer`**, `code-reviewer`, `security-reviewer`, `perf-reviewer` |
+| spec | **`spec-architect`** |
+| implement | `impl-planner`, **`software-engineer`** |
+| review | **`code-reviewer`**, `security-reviewer`, `perf-reviewer` |
+
+`spec-architect` absorbs both research (no separate `spec-researcher`) and adversarial
+self-review (no separate `spec-auditor`) — it investigates existing code/specs itself and
+re-reads its own draft before returning. `software-engineer` always writes its own tests (no
+separate `test-engineer`). There is no dedicated spec-compliance reviewer (no
+`spec-reviewer`): `code-reviewer` is the sole always-on review-phase agent, and nobody is
+tasked with judging AC coverage / scope creep against the spec as a gate — the
+`trace`/`guard` tables still get computed and shown in the review report, but no agent bases
+a verdict on them. `security-reviewer`/`perf-reviewer` attach independently of depth when
+`decide_depth()` in `scripts/sdd.py` detects a signal. This roster reflects a deliberate cut
+to keep a single spec's turnaround fast — see the trade-off notes in
+`skills/spec-driven-dev/references/roles.md` and `depth.md` before re-adding a role here.
 
 ## Structure
 
@@ -31,7 +43,7 @@ spec-driven-dev/
 │   └── plugin.json         # name: sdd, skills: "./skills/" — read by Codex CLI
 ├── skills/spec-driven-dev/ # SKILL.md orchestrator + references/ (both hosts)
 ├── commands/                # thin routers into the skill (/sdd:*) — Claude Code only
-├── agents/                  # 10 role-bound subagents (see above) — Claude Code only
+├── agents/                  # 6 role-bound subagents (see above) — Claude Code only
 ├── hooks/                   # phase_gate.py + hooks.json (opt-in per project) — Claude Code only
 ├── scripts/                 # sdd.py (stdlib-only CLI) + tests/ (both hosts)
 ├── templates/                # scaffolded artifacts (spec.md, tasks.md, review-report.md, AGENTS.sdd.md)
@@ -195,8 +207,10 @@ echo '{"cwd":"/tmp/x","tool_name":"Write","tool_input":{"file_path":"/tmp/x/src/
 ## What this repo deliberately does not do
 
 - It does not enforce test coverage numerically — `config.json`'s `minCoverage` is a threshold
-  handed to the Review Agent, not something `sdd.py` measures itself (coverage tooling is
-  language/runner-specific).
+  computed and surfaced in the review report (`build_review_report`), not something `sdd.py`
+  gates on itself (coverage tooling is language/runner-specific). With no spec-compliance
+  reviewer in the roster, nothing currently reads this value to decide a verdict — it's
+  informational only until a reviewer is told to use it.
 - It does not cover `Bash` in the phase-gate hook matcher — false-positive cost was judged
   higher than the value of blocking shell-redirect bypasses. `sdd.py guard` catches those
   after the fact via `git diff`/`git status` instead.

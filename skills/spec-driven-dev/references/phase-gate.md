@@ -57,21 +57,19 @@ PreToolUse 훅의 stdin 페이로드에는 `session_id`, `cwd`, `tool_name`, `to
 
 ## 같은 페이즈 안의 역할 분리는 강제되지 않는다
 
-에이전트가 페이즈당 여러 개로 세분화되면서 한 페이즈 안에 **쓰기 권한이 다른 역할이 여럿**
-생겼다. 게이트는 그 차이를 구분하지 못한다 — 위와 같은 이유로 호출자를 모르기 때문이다.
+한 페이즈 안에도 **쓰기 권한이 다른 역할이 여럿** 있다. 게이트는 그 차이를 구분하지
+못한다 — 위와 같은 이유로 호출자를 모르기 때문이다.
 
 | 경계 | 강제 수단 | 실제로 막히는가 |
 |---|---|---|
 | 페이즈 간 (spec ↔ implement ↔ review) | 훅 | **그렇다** |
-| 읽기 전용 역할 (researcher·auditor·리뷰어 4종) | `tools:` 프론트매터 | **그렇다** — 쓰기 도구가 없다 |
-| implement 안에서 engineer ↔ test-engineer | 프롬프트 | **아니다** |
+| 읽기 전용 역할 (리뷰어 3종) | `tools:` 프론트매터 | **그렇다** — 쓰기 도구가 없다 |
 | implement 안에서 planner의 `tasks.md` 전용 쓰기 | 프롬프트 (+ `specs/` 게이트) | 부분적 — `specs/` 밖은 안 막힌다 |
 
 **워크트리를 쓰면 파이프라인 경계는 되살아난다.** 훅의 페이로드에 호출자는 없어도
 **경로에는 슬러그가 있다.** `sdd.resolve_write()`가 그 경로를 주인 파이프라인에 귀속시키고,
 게이트는 전역 `state.phase`가 아니라 그 파이프라인의 `stage`로 판정한다(deny 메시지에
-`[슬러그]` 접두어가 붙는다). 여전히 해결되지 않는 것은 **같은 워크트리 안에서의 역할
-분리**다 — engineer와 test-engineer는 같은 디렉터리를 쓴다.
+`[슬러그]` 접두어가 붙는다).
 
 ### 어떤 페이즈로 판정하는가 (`resolve_write`)
 
@@ -88,10 +86,9 @@ PreToolUse 훅의 stdin 페이로드에는 `session_id`, `cwd`, `tool_name`, `to
 상황이 여기서 나왔다. 판정 자체(예: `implement` 전환이 유효한 명세를 요구하는 것)는 그대로
 받는다.
 
-깊은 모드에서 `software-engineer`가 `tests/`를 고치거나 `test-engineer`가 `src/`를 고치는
-것은 훅이 통과시킨다. `next`의 `instruction`이 그 금지를 담아 보내고, 두 에이전트의
-`filesChanged`·`testFiles`를 사후 대조해 확인해야 한다. 이 한계를 훅으로 메우려면
-서브에이전트 신원이 PreToolUse 페이로드에 실려야 한다.
+`impl-planner`가 `tasks.md` 밖의 `specs/` 파일을 고치는 것은 훅이 통과시킨다. `next`의
+`instruction`이 그 금지를 담아 보내고, `filesChanged`를 사후 대조해 확인해야 한다. 이
+한계를 훅으로 메우려면 서브에이전트 신원이 PreToolUse 페이로드에 실려야 한다.
 
 ## 경로 정규화
 

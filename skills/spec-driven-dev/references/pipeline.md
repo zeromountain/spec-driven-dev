@@ -137,8 +137,8 @@
 정리 작업이 판정을 뒤집으면 안 된다.
 
 `list`/`status` 는 아카이브를 `specs[]` 에서 빼고 **`archived[]`** 로 따로 준다.
-`spec-researcher` 는 `archivedSpecs` 로 그것을 받는다 — 완료된 기능이야말로 새 기능과
-충돌할 가능성이 가장 높아서, 아카이브됐다고 조사자 시야에서 지우면 안 된다.
+`spec-architect` 는 `archivedSpecs` 로 그것을 받는다 — 완료된 기능이야말로 새 기능과
+충돌할 가능성이 가장 높아서, 아카이브됐다고 아키텍트 시야에서 지우면 안 된다.
 
 `archive` 는 예약된 슬러그다. `run`·`new` 둘 다 거절한다.
 
@@ -161,9 +161,9 @@
 
 | 단계 | 깊은 모드 순서 | 되돌아가는 지점 |
 |---|---|---|
-| spec | researcher → architect → auditor | auditor가 `revision-requested` → **architect** (`specAudit` 카운트) |
-| implement | planner → engineer → tester | tester가 결함 보고 → **engineer** (`implement` 카운트) |
-| review | 리뷰어 전원 **동시** | 하나라도 `changes-requested` → implement 단계 |
+| spec | architect만(조사·감사도 architect가 직접 한다) | — |
+| implement | planner → engineer | 리뷰가 `changes-requested` → **engineer**(`implement` 카운트, planner는 다시 안 태운다) |
+| review | 리뷰어 전원 **동시**(신호 없으면 code-reviewer 혼자) | 하나라도 `changes-requested` → implement 단계 |
 
 - 로스터는 **단계에 진입할 때마다 다시 계산된다**(`refresh_roster`). spec에서 light였어도
   명세가 커졌으면 implement에서 deep이 될 수 있다. `run --depth`로 강제한 값은
@@ -178,9 +178,9 @@
 경량 모드에서도 형태는 같다 — 오케스트레이터가 분기할 일이 없게 한다.
 
 ```
-advance --result '{"reviews": [{"agent": "spec-reviewer", "verdict": "approved"},
-                               {"agent": "code-reviewer", "verdict": "changes-requested",
-                                "gaps": ["빈 catch"]}]}'
+advance --result '{"reviews": [{"agent": "code-reviewer", "verdict": "approved"},
+                               {"agent": "security-reviewer", "verdict": "changes-requested",
+                                "gaps": ["소유권 검사가 없다"]}]}'
 ```
 
 **결과는 누적된다.** 한 번에 다 넘겨도 되고 하나씩 넘겨도 된다 — 다만 각 결과에 `agent`

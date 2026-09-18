@@ -65,24 +65,24 @@ DEFAULT_STATE = {
     "updatedAt": None,
 }
 
-# 페이즈별 서브에이전트 구성. 경량 경로는 역할당 1명, 깊은 경로는 조사·작성·검토를
-# 분리한다. security/perf 리뷰어는 깊이와 무관하게 신호(키워드)가 잡힐 때만 붙는다.
+# 페이즈별 서브에이전트 구성. 경량/깊은 경로는 implement 단계(계획 분리 여부)에서만
+# 갈린다 — spec·review는 항상 같다. security/perf 리뷰어는 깊이와 무관하게
+# 신호(키워드)가 잡힐 때만 붙는다.
 AGENT_ROSTER = {
     "light": {
         "spec": ["spec-architect"],
         "implement": ["software-engineer"],
-        "review": ["spec-reviewer"],
+        "review": ["code-reviewer"],
     },
     "deep": {
-        "spec": ["spec-researcher", "spec-architect", "spec-auditor"],
-        "implement": ["impl-planner", "software-engineer", "test-engineer"],
-        "review": ["spec-reviewer", "code-reviewer"],
+        "spec": ["spec-architect"],
+        "implement": ["impl-planner", "software-engineer"],
+        "review": ["code-reviewer"],
     },
 }
 
-# 리포트에 항상 네 줄이 다 나와야 "실행되지 않음"과 "문제 없음"이 구분된다.
+# 리포트에 항상 세 줄이 다 나와야 "실행되지 않음"과 "문제 없음"이 구분된다.
 REVIEWER_CONCERNS = {
-    "spec-reviewer": "명세 준수·AC 커버리지·스펙 밖 구현",
     "code-reviewer": "가독성·복잡도·중복·에러 처리",
     "security-reviewer": "입력 검증·인가·시크릿·인젝션",
     "perf-reviewer": "N+1·복잡도·재계산·경계 없는 로딩",
@@ -1267,6 +1267,12 @@ def build_review_report(root: Path, slug, force=None, workdir=None) -> dict:
         "codeReviewSection": section_for("code-reviewer", "가독성·복잡도·중복·에러 처리"),
         "securityReviewSection": section_for("security-reviewer", "입력 검증·인가·시크릿"),
         "perfReviewSection": section_for("perf-reviewer", "N+1·복잡도·경계 없는 로딩"),
+        "specComplianceNote": (
+            "이 하네스에는 명세 준수(AC 커버리지·오류 케이스·스펙 밖 구현)를 전담 "
+            "판정하는 리뷰어가 없다 — 위 인수 기준·오류 케이스 커버리지 표(자동 계산)와 "
+            "아래 게이트 위반 표를 근거로 직접 확인해야 한다. code-reviewer는 코드 "
+            "품질만, security-reviewer·perf-reviewer는 해당 신호가 있을 때만 판정한다."
+        ),
     }), encoding="utf-8")
 
     return {"created": True, "path": str(out.relative_to(root)), "seq": seq,
@@ -1328,7 +1334,7 @@ def list_specs(root: Path) -> dict:
                 "reviewCount": len(reviews),
             })
 
-    # 아카이브는 숨기되 잃지는 않는다 — spec-researcher 에게 선행 사례로 넘어간다.
+    # 아카이브는 숨기되 잃지는 않는다 — spec-architect 에게 선행 사례로 넘어간다.
     archived = []
     archive_root = specs_dir / ARCHIVE_DIRNAME
     if archive_root.exists():
@@ -1491,20 +1497,11 @@ MAX_HISTORY = 40
 # 실제로 결정하는 키만 추린 것이고, 나머지 키는 무시된다. 단계가 아니라 **에이전트**로
 # 키를 잡는다 — 같은 단계 안에서도 전이를 결정하는 키가 역할마다 다르기 때문이다.
 RESULT_SCHEMA = {
-    "spec-researcher": {
-        "contextPack": "객체 — 다음 단계 spec-architect 프롬프트에 그대로 실린다",
-        "unknowns": "[string] — 코드를 읽어도 답이 안 나온 것 (질문 후보이지 질문 자체는 아니다)",
-    },
     "spec-architect": {
         "openQuestions": "[string] — 있으면 파이프라인이 멈추고 사용자에게 묻는다 (없으면 빈 배열)",
     },
-    "spec-auditor": {
-        "verdict": "accepted | revision-requested — 필수",
-        "acFindings": "[object] — revision-requested 일 때 아키텍트에게 그대로 되돌아간다",
-        "missingErrorCases": "[object] — 같이 되돌아간다",
-    },
     "impl-planner": {
-        "tasks": "[object] — 구현자·테스트작성자 양쪽 프롬프트에 실린다",
+        "tasks": "[object] — 구현자 프롬프트에 실린다",
         "testRunner": "객체 — {command, evidence}",
         "specChangeRequests": "[string] — 있으면 spec 단계로 되돌아가 새 버전을 만든다",
     },
@@ -1512,10 +1509,6 @@ RESULT_SCHEMA = {
         "filesChanged": "[string] — 리뷰어에게 전달된다",
         "testResult": {"passed": "int", "failed": "int", "raw": "string — 실패 시 핵심 출력"},
         "specChangeRequests": "[string] — 있으면 spec 단계로 되돌아가 새 버전을 만든다",
-    },
-    "test-engineer": {
-        "testResult": {"passed": "int", "failed": "int", "raw": "string — 실패 시 핵심 출력"},
-        "implementationDefects": "[object] — 있으면 구현자에게 되돌아간다 (테스트를 고치지 않는다)",
     },
     "_reviewer": {
         "verdict": "approved | changes-requested — 필수. 없으면 파이프라인이 멈춘다",
@@ -1543,13 +1536,23 @@ def current_agent(pipe: dict):
 
 def refresh_roster(root: Path, pipe: dict, force=None) -> dict:
     """단계에 진입할 때마다 깊이를 다시 판정한다 — spec 단계에서 light 였어도
-    명세가 커졌으면 implement 에서 deep 이 될 수 있다."""
+    명세가 커졌으면 implement 에서 deep 이 될 수 있다.
+
+    로스터가 바뀌면(플러그인 업그레이드로 역할이 사라지거나 순서가 바뀌면) 같은
+    agentIndex 가 다른 에이전트를 가리킬 수 있다 — 인덱스가 아니라 이름으로 자리를
+    다시 찾는다. 이름 자체가 새 로스터에 없으면(호출 중이던 역할이 없어졌으면)
+    이 단계를 처음부터 다시 돈다 (`next`는 단계당 idempotent 이므로 안전하다)."""
+    stage = pipe.get("stage")
+    old_agent = current_agent(pipe) if stage in PIPELINE_STAGES else None
     d = depth_for_slug(root, pipe.get("slug"), pipe.get("feature"),
                        force or pipe.get("forcedDepth"))
     pipe["roster"] = d["agents"]
     pipe["depth"] = d["depth"]
     pipe["depthReasons"] = d["deepReasons"]
     pipe["depthSignals"] = d["signals"]
+    if stage and old_agent:
+        new_roster = stage_roster(pipe, stage)
+        pipe["agentIndex"] = new_roster.index(old_agent) if old_agent in new_roster else 0
     return d
 
 
@@ -1564,8 +1567,7 @@ def _new_pipeline(feature: str, slug: str, max_attempts: int) -> dict:
         "roster": None,          # 단계 진입 시 refresh_roster 가 채운다
         "depth": None,
         "forcedDepth": None,
-        "attempts": {"spec": 0, "specAudit": 0, "specRevision": 0,
-                     "implement": 0, "review": 0},
+        "attempts": {"spec": 0, "specRevision": 0, "implement": 0, "review": 0},
         "maxAttempts": max_attempts,
         "steps": 0,
         "specPath": None,
@@ -1581,11 +1583,8 @@ def _new_pipeline(feature: str, slug: str, max_attempts: int) -> dict:
             "testFailures": None,
             "reviewGaps": [],
             "implementNotes": None,
-            "contextPack": None,
-            "auditFindings": None,
             "plan": None,
             "filesChanged": [],
-            "implementationDefects": [],
             "reviewVerdicts": [],
             "reviewResults": [],
         },
@@ -2267,6 +2266,7 @@ def _next_spec(root: Path, pipe: dict) -> dict:
     carry = pipe["carry"]
     version = pipe.get("specVersion") or find_latest_version(specs_dir, pipe["slug"])
     prev = specs_dir / pipe["slug"] / f"spec-v{version - 1}.md"
+    listing = list_specs(root)
     context = {
         "feature": pipe["feature"],
         "slug": pipe["slug"],
@@ -2279,35 +2279,20 @@ def _next_spec(root: Path, pipe: dict) -> dict:
         "userAnswers": carry.get("userAnswers") or {},
         "acPattern": config["acPattern"],
         "workdir": str(pipeline_workdir(root, pipe)),
-        "contextPack": carry.get("contextPack"),
-        "auditFindings": carry.get("auditFindings"),
+        "existingSpecs": listing["specs"],
+        # 완료된 기능이야말로 새 기능과 충돌할 가능성이 가장 높다 — 아카이브됐다고
+        # 아키텍트 시야에서 지우면 안 된다.
+        "archivedSpecs": listing["archived"],
     }
-    agent = current_agent(pipe)
-    if agent == "spec-researcher":
-        listing = list_specs(root)
-        context = {"feature": pipe["feature"], "slug": pipe["slug"],
-                   "specsDir": config["specsDir"],
-                   "existingSpecs": listing["specs"],
-                   # 완료된 기능이야말로 새 기능과 충돌할 가능성이 가장 높다 —
-                   # 아카이브됐다고 조사자 시야에서 지우면 안 된다.
-                   "archivedSpecs": listing["archived"]}
-        instruction = ("명세를 쓰기 전에 필요한 사실을 모아라. 제안하지 말고 "
-                       "'지금 이렇게 되어 있다'만 적는다. 아무 파일도 쓰지 마라.")
-    elif agent == "spec-auditor":
-        instruction = ("완성된 명세를 적대적으로 읽어라. validate가 통과시킨 구조 뒤의 "
-                       "의미 결함 — 검증 불가능한 AC, 모순, 정상 경로에 대응하는 오류 "
-                       "케이스 누락 — 을 찾는다. 명세를 고치지 마라.")
-    elif context["auditFindings"]:
-        instruction = ("spec-auditor가 revision-requested를 냈다. auditFindings가 지목한 "
-                       "AC/EC만 그 제안대로 고쳐라 — 지목되지 않은 부분은 건드리지 마라.")
-    elif context["validateErrors"]:
+    if context["validateErrors"]:
         instruction = ("직전 명세가 검증에 실패했다. validateErrors를 전부 해소하도록 "
                        "같은 파일을 고쳐라 (새 버전을 만들지 마라).")
     elif context["specChangeRequests"]:
         instruction = ("구현 단계에서 명세 변경 요청이 올라왔다. specChangeRequests를 반영한 "
                        "새 버전 명세를 specPath에 작성하라. previousSpecPath가 직전 버전이다.")
     else:
-        instruction = "specPath 파일의 모든 플레이스홀더를 채워 기능 명세를 완성하라."
+        instruction = ("existingSpecs·archivedSpecs와 기존 코드를 직접 조사해 근거를 잡은 "
+                       "뒤 specPath 파일의 모든 플레이스홀더를 채워 기능 명세를 완성하라.")
 
     _persist_pipeline(root, pipe)
     return _call_agent(pipe, "spec", context, instruction, phase)
@@ -2348,32 +2333,22 @@ def _next_implement(root: Path, pipe: dict) -> dict:
         "reviewRound": pipe["attempts"].get("review", 0),
         "plan": carry.get("plan"),
         "filesChanged": carry.get("filesChanged") or [],
-        "implementationDefects": carry.get("implementationDefects") or [],
     }
     agent = current_agent(pipe)
-    roster = stage_roster(pipe, "implement")
-    context["mode"] = "deep" if "test-engineer" in roster else "light"
 
     if agent == "impl-planner":
         instruction = ("인수 기준을 작업 단위로 쪼개고 영향 파일·따를 패턴·테스트 러너를 "
                        "실제 경로 근거와 함께 확정해 tasksPath의 플레이스홀더를 채워라. "
                        "구현 코드는 한 줄도 쓰지 마라.")
-    elif agent == "test-engineer":
-        instruction = ("인수 기준마다 최소 1개 테스트를 acPattern 태그와 함께 쓰고 실제로 "
-                       "실행하라. **구현 코드를 고치지 마라** — 실패는 "
-                       "implementationDefects로 보고한다.")
-    elif context["implementationDefects"]:
-        instruction = ("test-engineer가 구현 결함을 보고했다. implementationDefects를 보고 "
-                       "구현을 고쳐라 — 테스트를 고쳐서 통과시키지 마라.")
     elif context["reviewGaps"]:
         instruction = ("리뷰가 changes-requested를 냈다. reviewGaps 항목을 하나도 남기지 말고 "
                        "고쳐라. lastReviewPath에 리뷰 리포트 전문이 있다.")
     elif context["previousTestFailures"]:
         instruction = ("직전 시도의 테스트가 실패했다. previousTestFailures를 보고 **가설을 바꿔서** "
                        "고쳐라 — 같은 시도를 반복하지 마라.")
-    elif context["mode"] == "deep":
-        instruction = ("plan을 따라 명세의 인수 기준을 구현하라. **테스트 파일은 쓰지 마라** — "
-                       "test-engineer가 쓴다. 기존 테스트 실행까지만 한다.")
+    elif context["plan"]:
+        instruction = ("plan을 따라 명세의 인수 기준을 구현하고, AC별 최소 1개 테스트를 "
+                       "acPattern 태그와 함께 작성한 뒤 실제로 실행하라.")
     else:
         instruction = ("명세의 인수 기준을 구현하고, AC별 최소 1개 테스트를 "
                        "acPattern 태그와 함께 작성한 뒤 실제로 실행하라.")
@@ -2441,46 +2416,6 @@ def _next_review(root: Path, pipe: dict) -> dict:
 # --- advance -------------------------------------------------------------
 
 def _advance_spec(root: Path, pipe: dict, result: dict) -> None:
-    carry = pipe["carry"]
-    agent = current_agent(pipe)
-
-    if agent == "spec-researcher":
-        carry["contextPack"] = result.get("contextPack") or result
-        _record(pipe, "context-pack-collected",
-                unknowns=len(result.get("unknowns") or []))
-        _advance_agent(pipe)
-        return
-
-    if agent == "spec-auditor":
-        verdict = str(result.get("verdict") or "").strip().lower()
-        if verdict == "accepted":
-            carry["auditFindings"] = None
-            pipe["attempts"]["specAudit"] = 0
-            _record(pipe, "spec-audited", verdict="accepted")
-            _enter_stage(pipe, "implement")
-            return
-        if verdict == "revision-requested":
-            carry["auditFindings"] = {
-                "acFindings": result.get("acFindings") or [],
-                "contradictions": result.get("contradictions") or [],
-                "missingErrorCases": result.get("missingErrorCases") or [],
-                "undefinedBoundaries": result.get("undefinedBoundaries") or [],
-            }
-            pipe["attempts"]["specAudit"] += 1
-            _record(pipe, "spec-revision-requested",
-                    attempt=pipe["attempts"]["specAudit"])
-            if pipe["attempts"]["specAudit"] > pipe["maxAttempts"]:
-                _halt(pipe, f"명세 감사가 {pipe['attempts']['specAudit']}회 연속 "
-                            "revision-requested를 냈다 — 요구사항을 사용자와 다시 합의해야 한다")
-                return
-            # 아키텍트로 되돌린다 (로스터에서 architect 의 위치로).
-            roster = stage_roster(pipe, "spec")
-            pipe["agentIndex"] = roster.index("spec-architect")
-            return
-        _halt(pipe, f"명세 감사 판정을 읽을 수 없다 (verdict={result.get('verdict')!r}) — "
-                    "accepted 또는 revision-requested 여야 한다")
-        return
-
     _advance_spec_architect(root, pipe, result)
 
 
@@ -2516,7 +2451,7 @@ def _advance_spec_architect(root: Path, pipe: dict, result: dict) -> None:
     carry["reviewGaps"] = []
     pipe["attempts"]["spec"] = 0
     _record(pipe, "spec-valid", acCount=len(v["acIds"]), ecCount=len(v["ecIds"]))
-    # 로스터에 감사자가 있으면 구현으로 넘기기 전에 그쪽을 먼저 태운다.
+    # spec-architect는 spec 로스터의 마지막이다 — 더 부를 역할이 있으면 그쪽으로.
     if _advance_agent(pipe):
         return
     _enter_stage(pipe, "implement")
@@ -2535,10 +2470,6 @@ def _advance_implement(root: Path, pipe: dict, result: dict) -> None:
         }
         _record(pipe, "plan-ready", tasks=len(carry["plan"]["tasks"]))
         _advance_agent(pipe)
-        return
-
-    if agent == "test-engineer":
-        _advance_test_engineer(pipe, result)
         return
 
     changes = result.get("specChangeRequests") or []
@@ -2574,44 +2505,12 @@ def _advance_implement(root: Path, pipe: dict, result: dict) -> None:
 
     carry["testFailures"] = None
     carry["reviewGaps"] = []
-    carry["implementationDefects"] = []
     carry["filesChanged"] = result.get("filesChanged") or carry.get("filesChanged") or []
     pipe["attempts"]["implement"] = 0
     _record(pipe, "implement-done", testResult=tr or "보고 없음")
-    # 로스터에 테스트 작성자가 있으면 리뷰로 넘기기 전에 그쪽을 먼저 태운다.
+    # software-engineer는 implement 로스터의 마지막이다 — 더 부를 역할이 있으면 그쪽으로.
     if _advance_agent(pipe):
         return
-    _enter_stage(pipe, "review")
-
-
-def _advance_test_engineer(pipe: dict, result: dict) -> None:
-    """테스트 작성자는 구현을 고치지 않는다 — 실패는 구현자에게 되돌린다."""
-    carry = pipe["carry"]
-    tr = result.get("testResult")
-    carry["testResult"] = tr
-    defects = result.get("implementationDefects") or []
-    failed = _failed_count(tr)
-
-    if defects or failed:
-        carry["implementationDefects"] = defects
-        carry["testFailures"] = tr
-        pipe["attempts"]["implement"] += 1
-        _record(pipe, "tests-failed", failed=failed, defects=len(defects),
-                attempt=pipe["attempts"]["implement"])
-        if pipe["attempts"]["implement"] > pipe["maxAttempts"]:
-            _halt(pipe, f"테스트 실패가 {pipe['attempts']['implement']}회 이어졌다 "
-                        f"(구현 결함 {len(defects)}건) — 사용자 판단이 필요하다")
-            return
-        # 테스트를 고치는 게 아니라 구현자에게 되돌린다.
-        roster = stage_roster(pipe, "implement")
-        _enter_stage(pipe, "implement", roster.index("software-engineer"))
-        return
-
-    carry["testFailures"] = None
-    carry["implementationDefects"] = []
-    carry["reviewGaps"] = []
-    pipe["attempts"]["implement"] = 0
-    _record(pipe, "tests-passed", testResult=tr or "보고 없음")
     _enter_stage(pipe, "review")
 
 
@@ -2703,7 +2602,10 @@ def _advance_review(root: Path, pipe: dict, result: dict) -> None:
 
     # 리뷰어 결과는 **누적된다.** 한 번에 다 넘겨도 되고 하나씩 넘겨도 된다 —
     # 하나가 형식을 어겨도 그 리뷰어만 다시 부르면 되고, 라운드 전체를 다시 돌리지 않는다.
-    stored = {r["agent"]: r for r in (carry.get("reviewResults") or []) if r.get("agent")}
+    # roster 에 없는 이름은 버린다 — 로스터가 바뀐 사이(플러그인 업그레이드 등) 저장된
+    # 옛 리뷰어의 판정이 새 로스터의 완료 여부를 조용히 결정하면 안 된다.
+    stored = {r["agent"]: r for r in (carry.get("reviewResults") or [])
+              if r.get("agent") in roster}
     rejected, unknown = [], []
     for r in incoming:
         if not isinstance(r, dict):
@@ -2817,10 +2719,8 @@ def reopen_pipeline(root: Path, pipe: dict, stage: str, depth=None) -> dict:
     elif stage == "implement":
         pipe["attempts"]["implement"] = 0
         pipe["carry"]["testFailures"] = None
-        pipe["carry"]["implementationDefects"] = []
     else:
         pipe["attempts"]["spec"] = 0
-        pipe["attempts"]["specAudit"] = 0
 
     if depth is not None:
         pipe["forcedDepth"] = depth

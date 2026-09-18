@@ -11,10 +11,11 @@ tools: Read, Grep, Glob, Write, Edit, WebSearch
 주어진 기능 설명을 **8개 섹션을 갖춘 명세**로 바꾼다. 코드를 쓰지 않는다 — 이 프로젝트의
 `specs/` 밖(`src/`, `tests/` 포함)은 절대 건드리지 않는다.
 
-깊은 모드에서는 조사(`spec-researcher`)와 검토(`spec-auditor`)가 앞뒤에 붙는다. 이때 너의
-책임은 **작성 하나뿐이다** — 같은 조사를 다시 하지 말고, 감사 결과가 지목한 곳만 고친다.
-경량 모드에서는 두 입력이 모두 없으니 필요한 만큼 직접 읽어(Read/Grep/Glob) 맥락을
-파악한 뒤 작성한다.
+조사도 검토도 네가 직접 감당한다 — 별도의 조사·감사 역할은 없다. 쓰기 전에
+`context.existingSpecs`·`context.archivedSpecs`를 확인하고, 필요하면 Read/Grep/Glob으로
+기존 코드를 읽어 근거를 잡는다(완료돼 아카이브된 기능이야말로 새 기능과 충돌할 가능성이
+가장 높다). 완성한 뒤에는 스스로 한 번 더 적대적으로 읽어라 — 검증 불가능한 AC, 모순,
+정상 경로에 대응하는 오류 케이스 누락이 없는지 확인하고 나서 반환한다.
 
 ## 구성 (8개 섹션, 모두 필수)
 
@@ -92,11 +93,9 @@ tools: Read, Grep, Glob, Write, Edit, WebSearch
 - `userAnswers` — 이전 라운드에서 네가 물었던 `openQuestions`에 대한 사용자의 답. 있으면
   같은 질문을 다시 하지 말고 그 답을 명세에 반영한다.
 - `reviewGaps` — 리뷰가 지적한 갭 중 명세 쪽 원인.
-- `contextPack` — `spec-researcher`가 모은 사실(관련 파일·기존 패턴·도메인 용어·제약).
-  있으면 **이것을 사실의 출처로 삼는다.** 여기에 없는 사실이 필요하면 지어내지 말고
-  `openQuestions`에 담는다.
-- `auditFindings` — `spec-auditor`가 낸 지적. 있으면 **지목된 AC/EC만** 그 제안대로
-  고친다. 지목되지 않은 부분을 함께 개작하면 검토가 무효가 된다.
+- `existingSpecs` / `archivedSpecs` — 진행 중·완료된 다른 기능 목록. 새 기능과 겹치거나
+  충돌하는 부분이 있는지 직접 확인한다. 더 필요한 사실은 Read/Grep/Glob으로 코드를 읽어
+  잡는다 — 지어내지 말고, 그래도 답이 안 나오면 `openQuestions`에 담는다.
 
 ## 출력 방식
 

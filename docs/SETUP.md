@@ -45,7 +45,7 @@
    /plugin list
    ```
    목록에 `sdd@spec-driven-dev`가 나오면 설치된 것이다. `/help`에서도 `/sdd:init` 등
-   7개 커맨드가 보여야 한다.
+   9개 커맨드가 보여야 한다.
 
 CLI에서 미리 검증하고 싶다면(선택):
 ```bash
@@ -124,7 +124,6 @@ Codex에는 슬래시 커맨드가 없으므로 **의도를 말로 전한다.** 
 | 걸린 것 전부 진행 | `$sdd:spec-driven-dev 걸린 거 전부 같이 진행해줘` | `/sdd:run --all` |
 | 현황 보기 | `$sdd:spec-driven-dev 지금 뭐뭐 돌고 있어` | `/sdd:board` |
 | 이어서 하기 | `$sdd:spec-driven-dev 아까 하던 거 이어서` | `/sdd:run` |
-| 명세만 검토 | `$sdd:spec-driven-dev 명세 좀 봐줘` | `/sdd:audit` |
 | 워크트리 정리 | `$sdd:spec-driven-dev 워크트리 정리해줘` | `/sdd:worktree remove` |
 
 깊이를 직접 정하려면 "깊게" / "가볍게"를 덧붙인다(`--deep`/`--light`에 대응). 진행 위치는
@@ -185,7 +184,7 @@ Claude Code에서는 여기에 더해 **훅이 워크트리 경로로 파이프�
 |---|---|---|
 | `skills/spec-driven-dev/SKILL.md` | ✅ | ✅ |
 | `commands/*.md` (`/sdd:*`) | ✅ | ❌ (스킬을 직접 호출) |
-| `agents/*.md` (서브에이전트 10개) | ✅ | ❌ (Codex 플러그인은 서브에이전트 정의를 지원하지 않는다) |
+| `agents/*.md` (서브에이전트 6개) | ✅ | ❌ (Codex 플러그인은 서브에이전트 정의를 지원하지 않는다) |
 | `hooks/hooks.json` (페이즈 게이트) | ✅ (opt-in) | ❌ (Codex 플러그인 매니페스트에 훅 필드가 없다) |
 | `scripts/sdd.py` (파이프라인·깊이·스케줄러·워크트리) | ✅ | ✅ (스킬이 Bash로 호출) |
 
@@ -193,12 +192,12 @@ Claude Code에서는 여기에 더해 **훅이 워크트리 경로로 파이프�
 역할 구성 판정, 파이프라인 레지스트리와 병렬 스케줄러, 워크트리,
 `validate`/`trace`/`guard`. 차이는 두 가지뿐이다.
 
-**1. 역할을 누가 수행하는가.** Codex에서는 `spec-driven-dev` 스킬 하나가 10개 역할을
+**1. 역할을 누가 수행하는가.** Codex에서는 `spec-driven-dev` 스킬 하나가 6개 역할을
 **한 세션 안에서 순서대로 직접 수행**한다. `next`가 지정한 `agent`의 프롬프트를 스킬이
 직접 맡는데, `agents/*.md`는 Codex에 설치되지 않으므로 역할의 책임·금지 사항은
 `references/roles.md`가 근거다. `sdd.py depth`가 "이번엔 어느 역할까지 도는가"를 똑같이
 정해 주지만, 각 역할이 **독립된 컨텍스트에서 도는 이점은 Claude Code에서만** 얻는다 —
-구현자/테스트 작성자 분리와 리뷰어 4종의 독립 판정은 Codex에서 순차적 자기 점검에 가깝다.
+리뷰어 3종의 독립 판정은 Codex에서 순차적 자기 점검에 가깝다.
 
 **2. 게이트가 실제로 막는가.** 역할 경계(예: "Spec Architect는 src/를 쓰지 않는다")는
 Codex에서 스킬 프롬프트로만 지켜진다. 그래서 리뷰 단계의 `sdd.py guard`가 Codex에서는

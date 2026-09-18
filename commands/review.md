@@ -1,5 +1,5 @@
 ---
-description: 명세 준수·코드 품질·보안·성능 리뷰를 돌리고 리포트를 남긴다 (한 스텝만)
+description: 코드 품질·보안·성능 리뷰를 돌리고 리포트를 남긴다 (한 스텝만)
 argument-hint: [슬러그] [--deep|--light], 예: user-marital-status (비우면 진행 중인 파이프라인)
 ---
 

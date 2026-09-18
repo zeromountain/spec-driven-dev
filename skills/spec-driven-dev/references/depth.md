@@ -1,6 +1,6 @@
 # 깊이 판정 (`sdd.py depth`)
 
-에이전트가 10개가 되면 "이번엔 몇 명을 부를까"가 매번 달라진다. 모델이 "복잡해 보인다"로
+에이전트가 6개가 되면 "이번엔 몇 명을 부를까"가 매번 달라진다. 모델이 "복잡해 보인다"로
 정하면 같은 작업이 세션마다 다르게 돈다 — 그래서 판정을 `scripts/sdd.py`의 순수 함수
 `decide_depth()`로 옮겼다. 임계값과 키워드는 전부 그 모듈에 있다.
 
@@ -51,9 +51,9 @@ sdd.py depth [<슬러그>] --feature "<기능 설명>" [--force deep|light] --pa
   "thresholds": {"acCount": 8, "ecCount": 5, "warningCount": 3},
   "deepReasons": ["인수 기준이 9개로 임계값 8개 이상이다", "보안 신호가 잡혔다: 토큰"],
   "agents": {
-    "spec": ["spec-researcher", "spec-architect", "spec-auditor"],
-    "implement": ["impl-planner", "software-engineer", "test-engineer"],
-    "review": ["spec-reviewer", "code-reviewer", "security-reviewer"]
+    "spec": ["spec-architect"],
+    "implement": ["impl-planner", "software-engineer"],
+    "review": ["code-reviewer", "security-reviewer"]
   },
   "slug": "...", "version": 2, "basedOn": "spec", "stateUpdated": true
 }
@@ -68,7 +68,8 @@ sdd.py depth [<슬러그>] --feature "<기능 설명>" [--force deep|light] --pa
 
 ## 비용
 
-깊은 모드 + 두 신호가 다 잡히면 `/sdd:run` 한 번이 spec 3 + implement 3 + review 4 =
-**10개 서브에이전트**를 부르고, 리뷰가 `changes-requested`면 implement·review를 최대
-2회 더 돈다. 경량 모드는 3개다. 시작 전에 `depth`와 `deepReasons`를 알리는 것은 선택이
-아니라 규칙이다.
+깊은 모드 + 두 신호가 다 잡히면 `/sdd:run` 한 번이 spec 1 + implement 2 + review 3 =
+**6개 서브에이전트**를 부르고(스펙 감사·별도 조사·별도 테스트 작성 역할이 없어 spec은
+항상 1명, implement의 테스트는 engineer 자신이 쓴다), 리뷰가 `changes-requested`면
+implement·review를 최대 2회 더 돈다. 경량 모드는 3개다. 시작 전에 `depth`와
+`deepReasons`를 알리는 것은 선택이 아니라 규칙이다.
