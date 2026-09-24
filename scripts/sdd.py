@@ -50,6 +50,14 @@ SPEC_SPLIT_AC_COUNT = 15
 DEPTH_EXEMPT_WARNING_CODES = frozenset({"recommended-section-missing", "spec-too-large"})
 # contextDocs 를 어떻게 다룰지는 agents/*.md 에도 있지만 그건 Claude Code 전용이다 —
 # Codex 까지 닿으려면 next 의 instruction 에 실려야 한다.
+LEARNINGS_IN_CONTEXT = 20
+LEARNINGS_CLAUSE = (" learnings는 이 프로젝트가 과거 파이프라인의 실패에서 얻은 규칙이다 — "
+                    "어기지 마라.")
+LEARNING_LINE_RE = re.compile(r"^-\s+\*\*LRN-(\d+)\*\*\s*:\s*(.*?)\s*$")
+LEARNING_SOURCE_RE = re.compile(r"\s*_\((?:(.+?),\s*)?(\d{4}-\d{2}-\d{2})\)_$")
+# 회고 사실에 남기는 항목당 최대 개수와 길이 — 상태 파일이 끝없이 자라지 않게.
+RETRO_NOTE_LIMIT = 10
+RETRO_NOTE_CHARS = 200
 CONTEXT_DOCS_CLAUSE = (" contextDocs의 프로젝트 문서(PRD·아키텍처·ADR)를 먼저 읽어라 — "
                        "unfilled: true 인 문서는 빈 양식이니 근거로 쓰지 마라.")
 
@@ -71,6 +79,8 @@ DEFAULT_CONFIG = {
     # 사람이 승인해야 다음 단계로 넘어가는 지점. 명세는 설계의 결과라 사람이 판단하고,
     # 계획 승인은 원하는 프로젝트만 켠다. 한 run 에서만 끄려면 `run --no-gate`.
     "humanGates": {"spec": True, "plan": False},
+    # 회고에서 사람이 고른 교훈. 다음 파이프라인의 모든 에이전트 컨텍스트에 실린다.
+    "learningsPath": "docs/sdd/learnings.md",
 }
 
 DEFAULT_STATE = {
@@ -1530,6 +1540,8 @@ def cmd_status(args) -> dict:
         "specs": listing["specs"],
         "archived": listing["archived"],
         "guardViolations": violations,
+        "learnings": len(read_learnings(root, config)),
+        "reflectPending": sorted(s for s, p in pipes.items() if p.get("reflect") == "pending"),
         "pipeline": pipeline_summary(pipes.get(
             resolve_pipeline_slug(state, allow_active=True) or "")),
         "board": board(root),
@@ -1974,12 +1986,36 @@ def _record(pipe: dict, event: str, **detail) -> None:
     entry.update({k: v for k, v in detail.items() if v not in (None, [], {})})
     pipe["history"].append(entry)
     del pipe["history"][:-MAX_HISTORY]
+    # history 는 MAX_HISTORY 로 잘린다 — 회고가 셀 누적 횟수는 따로 둔다.
+    stats = pipe.setdefault("stats", {})
+    stats[event] = stats.get(event, 0) + 1
+
+
+def _note(pipe: dict, key: str, items) -> None:
+    """회고에 남길 구체적 내용(검증 오류·리뷰 갭 등)을 항목별로 최근 몇 개만 모은다."""
+    if isinstance(items, str):
+        items = [items]
+    notes = pipe.setdefault("retroNotes", {})
+    bucket = notes.setdefault(key, [])
+    for item in items or []:
+        text = item if isinstance(item, str) else json.dumps(item, ensure_ascii=False)
+        text = text.strip()
+        if text:
+            bucket.append(text[:RETRO_NOTE_CHARS])
+    del bucket[:-RETRO_NOTE_LIMIT]
+
+
+def _count_call(pipe: dict, agent) -> None:
+    calls = pipe.setdefault("calls", {})
+    name = agent or "(이름 없음)"
+    calls[name] = calls.get(name, 0) + 1
 
 
 def _halt(pipe: dict, reason: str) -> None:
     pipe["status"] = "halted"
     pipe["haltReason"] = reason
     _record(pipe, "halted", reason=reason)
+    _note(pipe, "haltReasons", reason)
 
 
 def _enter_stage(pipe: dict, stage: str, agent_index: int = 0) -> None:
@@ -2104,6 +2140,7 @@ def resolve_approval(pipe: dict, result: dict, by: str = "user"):
         carry["userFeedback"] = feedback
         pipe["status"] = "running"
         _record(pipe, "user-feedback", gate=gate, count=len(feedback))
+        _note(pipe, "userFeedback", feedback)
         return None
     return ("승인 대기 중이다 — `{\"approve\": true}` 또는 "
             "`{\"feedback\": [\"...\"]}` 를 넘겨라")
@@ -2194,6 +2231,7 @@ def pipeline_summary(pipe) -> dict:
         "haltReason": pipe.get("haltReason"),
         "pendingApproval": ((pipe.get("carry") or {}).get("pendingApproval") or {}).get("gate"),
         "gatesOff": bool(pipe.get("gatesOff")),
+        "reflect": pipe.get("reflect"),
         "startedAt": pipe.get("startedAt"),
         "updatedAt": pipe.get("updatedAt"),
     }
@@ -2344,7 +2382,9 @@ def compute_next_all(root: Path) -> dict:
         return {"action": "init-required",
                 "message": "이 프로젝트에는 아직 SDD가 설정되지 않았다 — 먼저 `sdd.py init` 을 실행하라"}
     sched = schedule(root)
-    if not sched["live"]:
+    reflecting = sorted(slug for slug, p in load_pipelines(load_state(root)).items()
+                        if p.get("status") == "done" and p.get("reflect") == "pending")
+    if not sched["live"] and not reflecting:
         return {"action": "none", "board": board(root),
                 "message": "진행 중인 파이프라인이 없다 — `sdd.py run \"<기능 설명>\"` 으로 시작하라"}
 
@@ -2353,7 +2393,7 @@ def compute_next_all(root: Path) -> dict:
         nxt = compute_next(root, slug)
         nxt["slug"] = slug
         actions.append(nxt)
-    for slug in sched.get("awaitingUser", []):
+    for slug in sched.get("awaitingUser", []) + reflecting:
         nxt = compute_next(root, slug)
         nxt["slug"] = slug
         actions.append(nxt)
@@ -2407,6 +2447,20 @@ def compute_next(root: Path, slug=None) -> dict:
                            "돌리면 자리가 난다. `next --all` 이 이번 라운드의 목록을 준다"}
 
     status = pipe.get("status")
+    if status == "done" and pipe.get("reflect") == "pending":
+        return {"action": "reflect", "pipeline": pipeline_summary(pipe),
+                "retroPath": pipe.get("retroPath"),
+                "facts": build_retro(pipe),
+                "message": ("승인으로 완료됐다. 회고 단계다 — facts(재시도·명세 변경·리뷰 갭·"
+                            "사람 피드백·에이전트 호출 수)를 보고 **다음 기능에서 같은 실수를 "
+                            "덜 하려면 무엇을 규칙으로 남길지** 후보를 0~3개 사용자에게 "
+                            "제안하라. 한 번에 통과했으면 0개가 정상이다. 사용자가 고른 것만 "
+                            "기록한다 — 네가 골라서 기록하지 마라. 같은 교훈이 반복되면 "
+                            "AGENTS.md의 SDD 섹션으로 옮기길 제안하라"),
+                "then": ("고른 교훈마다 `sdd.py learn --add \"<교훈>\" --spec " + pipe["slug"]
+                         + "`, 끝나면 `sdd.py learn --done --spec " + pipe["slug"]
+                         + "`. 사용자가 건너뛰면 `sdd.py learn --skip --spec "
+                         + pipe["slug"] + "`")}
     if status == "done":
         return {"action": "done", "pipeline": pipeline_summary(pipe),
                 "message": f"'{pipe['feature']}' 파이프라인이 승인으로 완료됐다"}
@@ -2552,6 +2606,7 @@ def _next_spec(root: Path, pipe: dict) -> dict:
         "archivedSpecs": listing["archived"],
         "contextDocs": context_docs(root, config),
         "parentSpecPath": parent_spec_path(root, pipe["specPath"], config),
+        "learnings": learnings_for_context(root, config),
     }
     if context["userFeedback"]:
         instruction = ("사용자가 명세를 검토하고 피드백을 줬다. userFeedback을 하나도 남기지 "
@@ -2567,6 +2622,8 @@ def _next_spec(root: Path, pipe: dict) -> dict:
                        "뒤 specPath 파일의 모든 플레이스홀더를 채워 기능 명세를 완성하라.")
 
     instruction += CONTEXT_DOCS_CLAUSE
+    if context["learnings"]:
+        instruction += LEARNINGS_CLAUSE
     if context["parentSpecPath"]:
         instruction += " parentSpecPath의 상위 명세와 범위·용어를 맞춰라."
 
@@ -2612,6 +2669,7 @@ def _next_implement(root: Path, pipe: dict) -> dict:
         "filesChanged": carry.get("filesChanged") or [],
         "contextDocs": context_docs(root, config),
         "parentSpecPath": parent_spec_path(root, pipe["specPath"], config),
+        "learnings": learnings_for_context(root, config),
     }
     agent = current_agent(pipe)
     if agent == "impl-planner":
@@ -2640,6 +2698,8 @@ def _next_implement(root: Path, pipe: dict) -> dict:
                        "acPattern 태그와 함께 작성한 뒤 실제로 실행하라.")
 
     instruction += CONTEXT_DOCS_CLAUSE
+    if context["learnings"]:
+        instruction += LEARNINGS_CLAUSE
     if context["parentSpecPath"]:
         instruction += " parentSpecPath의 상위 명세 인터페이스를 지켜라."
     if agent == "impl-planner":
@@ -2701,12 +2761,15 @@ def _next_review(root: Path, pipe: dict) -> dict:
     }
     context["filesChanged"] = carry.get("filesChanged") or []
     context["contextDocs"] = context_docs(root, config)
+    context["learnings"] = learnings_for_context(root, config)
     instruction = ("각자 자기 관심사만으로 reviewPath 리포트의 해당 절을 채우고 판정을 "
                    "내려라. 관심사가 겹치면 판정에 넣지 말고 handoffs로 넘긴다. "
                    "coverage·uncovered·guardViolations는 이미 측정된 값이니 다시 계산하지 마라.")
     if context["previousGaps"]:
         instruction += " previousGaps가 실제로 해소됐는지 먼저 확인하라."
     instruction += CONTEXT_DOCS_CLAUSE
+    if context["learnings"]:
+        instruction += LEARNINGS_CLAUSE
 
     _persist_pipeline(root, pipe)
     return _call_reviewers(pipe, context, instruction, phase)
@@ -2724,6 +2787,7 @@ def _advance_spec_architect(root: Path, pipe: dict, result: dict) -> None:
 
     questions = result.get("openQuestions") or []
     if questions:
+        _note(pipe, "openQuestions", questions)
         carry["openQuestions"] = questions
         pipe["status"] = "awaiting-user"
         _record(pipe, "awaiting-user", count=len(questions))
@@ -2737,6 +2801,7 @@ def _advance_spec_architect(root: Path, pipe: dict, result: dict) -> None:
     v = validate_spec(spec_path.read_text(encoding="utf-8"), path=spec_path)
     if not v["valid"]:
         carry["validateErrors"] = [e["message"] for e in v["errors"]]
+        _note(pipe, "validateErrors", carry["validateErrors"])
         pipe["attempts"]["spec"] += 1
         _record(pipe, "spec-invalid", errors=len(v["errors"]),
                 attempt=pipe["attempts"]["spec"])
@@ -2785,6 +2850,7 @@ def _advance_implement(root: Path, pipe: dict, result: dict) -> None:
 
     changes = result.get("specChangeRequests") or []
     if changes:
+        _note(pipe, "specChangeRequests", changes)
         carry["specChangeRequests"] = changes
         carry["testFailures"] = None
         carry["verifyFailures"] = None
@@ -2814,6 +2880,9 @@ def _advance_implement(root: Path, pipe: dict, result: dict) -> None:
         # testFailures 에 통과한 결과를 실으면 재시도한 구현자가 실패를 못 본다.
         carry["testFailures"] = tr if failed else None
         carry["verifyFailures"] = vfailed or None
+        if failed:
+            _note(pipe, "testFailures", str((tr or {}).get("raw") or f"{failed}개 실패"))
+        _note(pipe, "verifyFailures", [f"{v['command']} → {v['exitCode']}" for v in vfailed])
         pipe["attempts"]["implement"] += 1
         _record(pipe, "tests-failed", failed=failed or 0, verifyFailed=len(vfailed),
                 attempt=pipe["attempts"]["implement"])
@@ -3025,7 +3094,13 @@ def _advance_review(root: Path, pipe: dict, result: dict) -> None:
         if tasks_path:
             ticked += tick_all_checkboxes(tasks_path)
         ok = set_spec_status(spec_path, "done") if spec_path.exists() else False
+        # 회고 사실은 명세 디렉터리에 쓴다 — 바로 뒤의 이동으로 아카이브에 함께 간다.
+        retro = write_retro(root, pipe, spec_path.parent) if spec_path.parent.is_dir() else None
         arch = archive_spec_dir(root, pipe, config)
+        if retro:
+            base = root / arch["dir"] if arch.get("archived") else spec_path.parent
+            pipe["retroPath"] = _rel(root, base / retro)
+            pipe["reflect"] = "pending"
         transition_phase(root, "off", pipe["slug"], apply=apply_phase)
         # 완료된 슬러그가 activeSpec 으로 남으면 나중에 --spec 없는 `phase implement` 가
         # 그걸 폴백으로 집어 "spec 를 찾을 수 없다"로 막힌다.
@@ -3035,11 +3110,13 @@ def _advance_review(root: Path, pipe: dict, result: dict) -> None:
         pipe["stage"] = "done"
         _record(pipe, "approved", specStatusUpdated=ok, ticked=ticked,
                 archived=arch["archived"], archivePath=arch.get("dir"),
-                archiveSkipped=arch.get("reason"), reviewPath=pipe.get("reviewPath"))
+                archiveSkipped=arch.get("reason"), reviewPath=pipe.get("reviewPath"),
+                retroPath=pipe.get("retroPath"))
         return
 
     if verdict == "changes-requested":
         gaps = result.get("gaps") or []
+        _note(pipe, "reviewGaps", gaps)
         carry["reviewGaps"] = gaps
         pipe["attempts"]["review"] += 1
         _record(pipe, "changes-requested", gaps=len(gaps), attempt=pipe["attempts"]["review"])
@@ -3076,6 +3153,7 @@ def reopen_pipeline(root: Path, pipe: dict, stage: str, depth=None) -> dict:
     pipe["carry"]["reviewResults"] = []
     pipe["carry"]["reviewVerdicts"] = []
     pipe["carry"]["pendingApproval"] = None
+    pipe["reflect"] = None
     if stage == "review":
         # 리포트 골격을 새로 만들게 한다 — 낡은 리포트에 새 리뷰어 절이 없다.
         pipe["reviewPath"] = None
@@ -3145,6 +3223,211 @@ def _run_all(root: Path, pipes: dict, resume: bool = False) -> dict:
             "then": "next 의 round[] 를 한 메시지에서 동시에 호출하고, 각 결과를 "
                     "`advance --spec <슬러그>` 로 따로 넘긴 뒤 `next --all` 로 다음 라운드를 "
                     "연다. round 가 빌 때까지 반복한다"}
+
+
+# ---------------------------------------------------------------------------
+# 회고와 학습 루프
+# ---------------------------------------------------------------------------
+#
+# 사실(몇 번 다시 했고 무엇이 막혔는가)은 스크립트가 센다. 교훈(그래서 다음엔 무엇을
+# 지킬 것인가)은 판단이라 메인 세션이 제안하고 사람이 고른다. 고른 교훈은 learnings.md 에
+# 쌓이고, 다음 파이프라인의 모든 next 가 그것을 context.learnings 로 싣는다 — 여기서
+# 루프가 닫힌다.
+
+RETRO_COUNTERS = (
+    ("spec-invalid", "명세 검증 실패"),
+    ("awaiting-user", "미결 질문으로 멈춤"),
+    ("user-feedback", "사람 피드백으로 되돌림"),
+    ("spec-change-requested", "구현 중 명세 변경 요청"),
+    ("tests-failed", "테스트·검증 커맨드 실패"),
+    ("changes-requested", "리뷰 changes-requested"),
+    ("halted", "halted"),
+)
+RETRO_NOTE_TITLES = (
+    ("validateErrors", "명세 검증 오류"),
+    ("openQuestions", "미결 질문"),
+    ("userFeedback", "사람 피드백"),
+    ("specChangeRequests", "명세 변경 요청"),
+    ("testFailures", "테스트 실패"),
+    ("verifyFailures", "검증 커맨드 실패"),
+    ("reviewGaps", "리뷰 갭"),
+    ("haltReasons", "멈춘 이유"),
+)
+
+
+def build_retro(pipe: dict) -> dict:
+    """회고의 사실 부분. 전부 파이프라인 레코드에서 센 값이다."""
+    stats = pipe.get("stats") or {}
+    return {
+        "slug": pipe.get("slug"),
+        "feature": pipe.get("feature"),
+        "specVersion": pipe.get("specVersion"),
+        "depth": pipe.get("depth"),
+        "steps": pipe.get("steps"),
+        "counts": {event: stats.get(event, 0) for event, _ in RETRO_COUNTERS},
+        "agentCalls": dict(sorted((pipe.get("calls") or {}).items())),
+        "notes": {k: v for k, v in (pipe.get("retroNotes") or {}).items() if v},
+        "startedAt": pipe.get("startedAt"),
+        "finishedAt": now_iso(),
+        "clean": not any(stats.get(event, 0) for event, _ in RETRO_COUNTERS),
+    }
+
+
+def write_retro(root: Path, pipe: dict, directory: Path):
+    """회고 사실을 `retro-v<N>.md` 로 쓴다. 파일 이름을 돌려준다(실패하면 None)."""
+    facts = build_retro(pipe)
+    labels = dict(RETRO_COUNTERS)
+    count_rows = "\n".join(f"| {labels[e]} | {n} |" for e, n in facts["counts"].items())
+    call_rows = "\n".join(f"| `{a}` | {n} |" for a, n in facts["agentCalls"].items()) \
+        or "| — | 기록 없음 |"
+    note_blocks = []
+    for key, title in RETRO_NOTE_TITLES:
+        items = facts["notes"].get(key)
+        if items:
+            note_blocks.append(f"### {title}\n\n" + "\n".join(f"- {i}" for i in items))
+    name = f"retro-v{facts['specVersion'] or 1}.md"
+    try:
+        (directory / name).write_text(fill_template("retro.md", {
+            "slug": str(facts["slug"]),
+            "feature": str(facts["feature"]),
+            "specVersion": str(facts["specVersion"]),
+            "depth": str(facts["depth"]),
+            "steps": str(facts["steps"]),
+            "startedAt": str(facts["startedAt"]),
+            "finishedAt": facts["finishedAt"],
+            "verdictLine": ("재시도·되돌림 없이 한 번에 통과했다." if facts["clean"]
+                            else "아래 횟수만큼 되돌아갔다 — 교훈 후보는 여기서 나온다."),
+            "countRows": count_rows,
+            "callRows": call_rows,
+            "noteBlocks": "\n\n".join(note_blocks) or "- 없음",
+        }), encoding="utf-8")
+    except OSError:
+        return None
+    return name
+
+
+LEARNINGS_HEADER = """# 학습 규칙
+
+> `sdd` 파이프라인 회고에서 사람이 고른 교훈이다. 모든 서브에이전트가 다음 작업부터 이
+> 규칙을 컨텍스트로 받는다. 직접 고치거나 지워도 된다 — `LRN-N` ID만 유지하면 된다.
+> 여러 기능에 걸쳐 반복되는 규칙은 AGENTS.md로 옮기는 편이 낫다.
+
+"""
+
+
+def learnings_path(root: Path, config=None) -> Path:
+    config = config or load_config(root)
+    return root / (config.get("learningsPath") or DEFAULT_CONFIG["learningsPath"])
+
+
+def read_learnings(root: Path, config=None) -> list:
+    path = learnings_path(root, config)
+    if not path.is_file():
+        return []
+    out = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        m = LEARNING_LINE_RE.match(line.strip())
+        if not m:
+            continue
+        text, slug, date = m.group(2), None, None
+        src = LEARNING_SOURCE_RE.search(text)
+        if src:
+            slug, date = src.group(1), src.group(2)
+            text = text[:src.start()].rstrip()
+        out.append({"id": f"LRN-{m.group(1)}", "num": int(m.group(1)), "text": text,
+                    "spec": slug, "date": date})
+    return out
+
+
+def learnings_for_context(root: Path, config=None) -> list:
+    return [f"{l['id']}: {l['text']}" for l in read_learnings(root, config)][-LEARNINGS_IN_CONTEXT:]
+
+
+def _write_text_atomic(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def add_learning(root: Path, text: str, spec=None) -> dict:
+    text = " ".join(str(text).split())
+    if not text:
+        return {"ok": False, "reason": "교훈 내용이 비어 있다"}
+    path = learnings_path(root)
+    with state_lock(root):
+        body = path.read_text(encoding="utf-8") if path.is_file() else LEARNINGS_HEADER
+        num = max((l["num"] for l in read_learnings(root)), default=0) + 1
+        # 출처 슬러그가 없으면 날짜만 남긴다 — 가짜 슬러그를 쓰면 읽는 쪽이 슬러그로 오해한다.
+        source = f" _({spec}, {now_iso()[:10]})_" if spec else f" _({now_iso()[:10]})_"
+        if not body.endswith("\n"):
+            body += "\n"
+        body += f"- **LRN-{num}**: {text}{source}\n"
+        _write_text_atomic(path, body)
+    return {"ok": True, "id": f"LRN-{num}", "path": _rel(root, path), "text": text}
+
+
+def remove_learning(root: Path, lrn_id: str) -> dict:
+    path = learnings_path(root)
+    m = re.fullmatch(r"(?:LRN-)?(\d+)", str(lrn_id).strip(), re.IGNORECASE)
+    if not m or not path.is_file():
+        return {"ok": False, "reason": f"'{lrn_id}' 교훈을 찾을 수 없다"}
+    num = int(m.group(1))
+    with state_lock(root):
+        lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+        kept = [l for l in lines
+                if not ((mm := LEARNING_LINE_RE.match(l.strip())) and int(mm.group(1)) == num)]
+        if len(kept) == len(lines):
+            return {"ok": False, "reason": f"'LRN-{num}' 교훈을 찾을 수 없다"}
+        _write_text_atomic(path, "".join(kept))
+    return {"ok": True, "removed": f"LRN-{num}"}
+
+
+def finish_reflect(root: Path, pipe: dict, skipped: bool) -> dict:
+    """회고를 닫는다. 이 기능에서 나온 교훈을 retro 파일에 덧붙여 기록을 한 곳에 모은다."""
+    if pipe.get("reflect") != "pending":
+        return {"ok": False, "reason": f"'{pipe['slug']}' 는 회고 대기 중이 아니다",
+                "reflect": pipe.get("reflect")}
+    lessons = [l for l in read_learnings(root) if l["spec"] == pipe["slug"]]
+    retro = root / pipe["retroPath"] if pipe.get("retroPath") else None
+    if retro and retro.is_file():
+        tail = ("\n## 기록된 교훈\n\n"
+                + ("\n".join(f"- {l['id']}: {l['text']}" for l in lessons)
+                   if lessons and not skipped else
+                   "- 회고를 건너뛰었다" if skipped else "- 남길 교훈 없음")
+                + "\n")
+        retro.write_text(retro.read_text(encoding="utf-8").rstrip("\n") + "\n" + tail,
+                         encoding="utf-8")
+    pipe["reflect"] = "skipped" if skipped else "done"
+    _record(pipe, "reflect-skipped" if skipped else "reflected", lessons=len(lessons))
+    _persist_pipeline(root, pipe, focus=False)
+    return {"ok": True, "slug": pipe["slug"], "reflect": pipe["reflect"],
+            "lessons": [l["id"] for l in lessons] if not skipped else [],
+            "next": compute_next(root, pipe["slug"])}
+
+
+def cmd_learn(args) -> dict:
+    root = Path(args.path).resolve()
+    if not (root / ".sdd" / "state.json").exists():
+        return {"ok": False, "action": "init-required",
+                "reason": "이 프로젝트에는 아직 SDD가 설정되지 않았다 — 먼저 `sdd.py init` 을 실행하라"}
+    if args.list:
+        items = read_learnings(root)
+        return {"ok": True, "path": _rel(root, learnings_path(root)), "count": len(items),
+                "learnings": items}
+    if args.remove:
+        return remove_learning(root, args.remove)
+    if args.add is not None:
+        return add_learning(root, args.add, args.spec)
+
+    pipes = load_pipelines(load_state(root))
+    pending = sorted(s for s, p in pipes.items() if p.get("reflect") == "pending")
+    target = args.spec or (pending[0] if len(pending) == 1 else None)
+    if not target or target not in pipes:
+        return {"ok": False, "reflectPending": pending,
+                "reason": ("회고 대기 중인 파이프라인이 없다" if not pending else
+                           "회고 대기 중인 파이프라인이 여럿이다 — `--spec <슬러그>` 로 밝혀라")}
+    return finish_reflect(root, pipes[target], skipped=bool(args.skip))
 
 
 def _skip_gates(root: Path, pipe: dict, persist: bool = True) -> None:
@@ -3422,6 +3705,20 @@ def cmd_advance(args) -> dict:
                               f"'{args.stage}' 로 왔다. `next` 를 먼저 확인하라",
                     "pipeline": pipeline_summary(pipe)}
         pipe["steps"] += 1
+        if stage_before == "review":
+            # 로스터 밖 이름(옛 로스터의 리뷰어 등)은 _advance_review 가 버린다 — 여기서도
+            # 세지 않아야 회고의 호출 수가 실제로 반영된 결과와 맞는다.
+            roster = stage_roster(pipe, "review")
+            reviews = result.get("reviews") if isinstance(result.get("reviews"), list) \
+                else [result]
+            for r in reviews:
+                if not isinstance(r, dict):
+                    continue
+                name = r.get("agent") or (roster[0] if len(roster) == 1 else None)
+                if name in roster:
+                    _count_call(pipe, name)
+        else:
+            _count_call(pipe, current_agent(pipe))
         if pipe["steps"] > MAX_PIPELINE_STEPS:
             _halt(pipe, f"단계 전환이 {MAX_PIPELINE_STEPS}회를 넘었다 — 루프가 수렴하지 않는다")
         else:
@@ -3580,6 +3877,17 @@ def build_parser() -> argparse.ArgumentParser:
     wt.add_argument("--no-worktree", dest="worktree", action="store_false",
                     help="config 가 켜져 있어도 본체에서 작업한다")
     sp.set_defaults(func=cmd_run)
+
+    sp = sub.add_parser("learn", help="회고 교훈을 기록·조회하고 회고 단계를 닫는다")
+    add_path(sp)
+    act = sp.add_mutually_exclusive_group(required=True)
+    act.add_argument("--add", default=None, metavar="TEXT", help="교훈 한 줄을 learnings.md 에 추가한다")
+    act.add_argument("--list", action="store_true", help="기록된 교훈을 나열한다")
+    act.add_argument("--remove", default=None, metavar="LRN-N", help="교훈을 지운다")
+    act.add_argument("--done", action="store_true", help="회고를 닫는다 (교훈을 retro 파일에 남긴다)")
+    act.add_argument("--skip", action="store_true", help="회고를 건너뛴다")
+    sp.add_argument("--spec", default=None, help="대상 파이프라인 슬러그 (교훈의 출처로도 쓰인다)")
+    sp.set_defaults(func=cmd_learn)
 
     sp = sub.add_parser("next", help="다음 행동을 지시한다 (--all 이면 동시 실행 가능한 전부)")
     add_path(sp)

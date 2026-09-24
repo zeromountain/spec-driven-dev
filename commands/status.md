@@ -11,6 +11,8 @@ argument-hint: (인자 없음)
 면 `sdd.py next`로 다음 행동까지 확인해 알린다(`/sdd:run`으로 이어갈 수 있다고 안내).
 
 `board.counts.live`가 2 이상이면 파이프라인별 한 줄 요약(슬러그·단계·runnable/waiting)도
-함께 보여주고, 자세한 현황은 `/sdd:board`라고 안내한다.
+함께 보여주고, 자세한 현황은 `/sdd:board`라고 안내한다. `reflectPending`이 있으면 회고가
+남아 있다고 알리고(`/sdd:run`으로 이어가면 `reflect`가 나온다), 쌓인 교훈 수(`learnings`)도
+한 줄로 보여준다.
 
 `.sdd/state.json`이 없으면 아직 `/sdd:init`이 안 된 것이니 그 사실만 알리고 안내한다.

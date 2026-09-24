@@ -103,6 +103,7 @@ tools: Read, Write, Edit, Grep, Glob, Bash
   보고되지 않았다는 뜻이다. `previousTestFailures`와 같은 규율로 다룬다.
 - `contextDocs` — 프로젝트 지식 문서(PRD·아키텍처·ADR). 관례·결정을 확인할 때 읽는다
   (`unfilled: true`는 빈 양식). `parentSpecPath`가 있으면 상위 명세의 인터페이스를 지킨다.
+- `learnings` — 과거 회고에서 사람이 고른 규칙(`LRN-N: ...`). 어기지 않는다.
 
 명세를 바꿔야만 구현할 수 있으면 임의로 구현하지 말고 `specChangeRequests`에 담아 반환한다 —
 파이프라인이 명세 단계로 되돌려 새 버전을 만든다.

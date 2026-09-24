@@ -535,7 +535,7 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(after_impl["next"]["roster"], ["code-reviewer"])
 
             after_review = _advance(root, {"verdict": "approved"})
-            self.assertEqual(after_review["next"]["action"], "done")
+            self.assertEqual(after_review["next"]["action"], "reflect")  # 승인 → 회고 단계
             self.assertEqual(after_review["pipeline"]["status"], "done")
             self.assertEqual(sdd.load_state(root)["phase"], "off")
 
@@ -721,7 +721,7 @@ class PipelineTests(unittest.TestCase):
             _advance(root, {})
             _advance(root, {"testResult": {"passed": 1, "failed": 0}})
             _advance(root, {"verdict": "approved"})
-            self.assertEqual(_next(root)["action"], "done")
+            self.assertEqual(_next(root)["action"], "reflect")
             first_report = sdd.load_pipelines(sdd.load_state(root))["테스트-기능"]["reviewPath"]
 
             archived = root / "specs" / "archive" / "테스트-기능" / "spec-v1.md"
@@ -1816,7 +1816,7 @@ class ArchiveTests(unittest.TestCase):
 
             out = _advance(root, {"verdict": "approved"})
             self.assertEqual(out["pipeline"]["status"], "done")
-            self.assertEqual(out["next"]["action"], "done")
+            self.assertEqual(out["next"]["action"], "reflect")
             self.assertEqual((blocker / "spec-v1.md").read_text(encoding="utf-8"),
                              "먼저 있던 것")
             # 명세는 제자리에 남되 체크와 status는 이미 기록됐다.
@@ -2202,6 +2202,128 @@ class HumanGateTests(unittest.TestCase):
             _write_valid_spec(root, reopened["next"]["context"]["specPath"])
             after = _advance(root, {"openQuestions": []})
             self.assertEqual(after["next"]["action"], "approve")
+
+
+
+def _learn(root: Path, **kw):
+    return sdd.cmd_learn(_ns(path=str(root), add=kw.get("add"), list=kw.get("list", False),
+                             remove=kw.get("remove"), done=kw.get("done", False),
+                             skip=kw.get("skip", False), spec=kw.get("spec")))
+
+
+class ReflectTests(unittest.TestCase):
+    """승인 → 회고 사실 기록 → 사람이 고른 교훈 → 다음 파이프라인 컨텍스트."""
+
+    def _approve_with_a_bumpy_ride(self, root):
+        spec_rel = _run(root, "테스트 기능")["next"]["context"]["specPath"]
+        (root / spec_rel).write_text("망가진 명세", encoding="utf-8")
+        _advance(root, {"openQuestions": []})                         # spec-invalid
+        _write_valid_spec(root, spec_rel)
+        _advance(root, {"openQuestions": []})                         # → implement
+        _advance(root, {"testResult": {"passed": 1, "failed": 1, "raw": "AC-2 assert"}})
+        _advance(root, {"testResult": {"passed": 2, "failed": 0}})     # → review
+        _advance(root, {"verdict": "changes-requested", "gaps": ["에러 메시지 누락"]})
+        _advance(root, {"testResult": {"passed": 2, "failed": 0}})
+        return _advance(root, {"verdict": "approved"})
+
+    def test_approval_writes_retro_into_archive_and_asks_to_reflect(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(tmp)
+            out = self._approve_with_a_bumpy_ride(root)
+            nxt = out["next"]
+            self.assertEqual(nxt["action"], "reflect")
+            self.assertEqual(nxt["pipeline"]["status"], "done")
+            self.assertTrue(nxt["retroPath"].startswith("specs/archive/테스트-기능/retro-v1"))
+            facts = nxt["facts"]
+            self.assertEqual(facts["counts"]["spec-invalid"], 1)
+            self.assertEqual(facts["counts"]["tests-failed"], 1)
+            self.assertEqual(facts["counts"]["changes-requested"], 1)
+            self.assertFalse(facts["clean"])
+            self.assertEqual(facts["agentCalls"]["software-engineer"], 3)
+            self.assertIn("에러 메시지 누락", facts["notes"]["reviewGaps"])
+            retro = (root / nxt["retroPath"]).read_text(encoding="utf-8")
+            self.assertNotIn("{{", retro)
+            self.assertIn("에러 메시지 누락", retro)
+
+    def test_off_roster_reviewer_is_not_counted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(tmp)
+            spec_rel = _run(root, "테스트 기능")["next"]["context"]["specPath"]
+            _write_valid_spec(root, spec_rel)
+            _advance(root, {"openQuestions": []})
+            _advance(root, {"testResult": {"passed": 2, "failed": 0}})
+            out = _advance(root, {"reviews": [
+                {"agent": "code-reviewer", "verdict": "approved"},
+                {"agent": "spec-reviewer", "verdict": "approved"}]})
+            calls = out["next"]["facts"]["agentCalls"]
+            self.assertEqual(calls.get("code-reviewer"), 1)
+            self.assertNotIn("spec-reviewer", calls)
+
+    def test_stats_survive_history_truncation(self):
+        pipe = sdd._new_pipeline("f", "f", 2)
+        for _ in range(sdd.MAX_HISTORY + 5):
+            sdd._record(pipe, "tests-failed")
+        self.assertEqual(len(pipe["history"]), sdd.MAX_HISTORY)
+        self.assertEqual(sdd.build_retro(pipe)["counts"]["tests-failed"], sdd.MAX_HISTORY + 5)
+
+    def test_learned_rules_reach_the_next_pipeline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(tmp)
+            self._approve_with_a_bumpy_ride(root)
+            added = _learn(root, add="에러 응답에는 항상 사용자용 메시지를 넣는다", spec="테스트-기능")
+            self.assertEqual(added["id"], "LRN-1")
+            done = _learn(root, done=True)
+            self.assertEqual(done["reflect"], "done")
+            self.assertEqual(done["next"]["action"], "done")
+            retro = (root / "specs/archive/테스트-기능/retro-v1.md").read_text(encoding="utf-8")
+            self.assertIn("LRN-1: 에러 응답에는", retro)
+
+            nxt = _run(root, "다른 기능")["next"]
+            self.assertEqual(nxt["context"]["learnings"],
+                             ["LRN-1: 에러 응답에는 항상 사용자용 메시지를 넣는다"])
+            self.assertIn("learnings", nxt["instruction"])
+
+    def test_skip_closes_reflect_without_lessons(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(tmp)
+            self._approve_with_a_bumpy_ride(root)
+            out = _learn(root, skip=True, spec="테스트-기능")
+            self.assertEqual(out["reflect"], "skipped")
+            self.assertFalse(_learn(root, done=True)["ok"])   # 이미 닫혔다
+
+    def test_learnings_file_roundtrip_and_remove(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(tmp)
+            _learn(root, add="규칙 A")
+            _learn(root, add="규칙 B", spec="x")
+            self.assertTrue(_learn(root, remove="LRN-1")["ok"])
+            items = _learn(root, list=True)["learnings"]
+            self.assertEqual([(i["id"], i["text"], i["spec"]) for i in items],
+                             [("LRN-2", "규칙 B", "x")])
+            untagged = _learn(root, add="출처 없는 규칙")
+            item = next(i for i in _learn(root, list=True)["learnings"]
+                        if i["id"] == untagged["id"])
+            self.assertEqual((item["text"], item["spec"]), ("출처 없는 규칙", None))
+            self.assertIsNotNone(item["date"])
+            # 지운 번호는 재사용하지 않는다
+            self.assertEqual(_learn(root, add="규칙 C")["id"], "LRN-4")
+            self.assertFalse(_learn(root, remove="LRN-9")["ok"])
+
+    def test_reflect_pending_shows_in_batch_without_blocking(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(tmp)
+            self._approve_with_a_bumpy_ride(root)
+            _run(root, "다른 기능")
+            batch = _next(root, all=True)
+            actions = {a["slug"]: a["action"] for a in batch["round"]}
+            self.assertEqual(actions, {"다른-기능": "call-agent", "테스트-기능": "reflect"})
+
+    def test_empty_context_has_no_learnings_clause(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(tmp)
+            nxt = _run(root, "테스트 기능")["next"]
+            self.assertEqual(nxt["context"]["learnings"], [])
+            self.assertNotIn(sdd.LEARNINGS_CLAUSE.strip(), nxt["instruction"])
 
 
 if __name__ == "__main__":

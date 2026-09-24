@@ -115,6 +115,9 @@ tools: Read, Grep, Glob, Write, Edit, WebSearch
 - `contextDocs` — 프로젝트 지식 문서(PRD·아키텍처·ADR) 경로. 먼저 읽는다.
   `unfilled: true`면 아직 빈 양식이다 — 근거로 쓰지 않는다.
 - `parentSpecPath` — 이 명세의 상위 명세(있으면). 상위 명세의 범위·용어를 따른다.
+- `learnings` — 과거 파이프라인 회고에서 사람이 고른 규칙(`LRN-N: ...`). 명세를 쓸 때
+  어기지 않는다(예: "에러 응답에는 사용자용 메시지를 넣는다"면 오류 케이스에 반영).
+- `userFeedback` — 사람이 명세 승인 단계에서 준 지적. 같은 파일에서 전부 반영한다.
 - `existingSpecs` / `archivedSpecs` — 진행 중·완료된 다른 기능 목록. 새 기능과 겹치거나
   충돌하는 부분이 있는지 직접 확인한다. 더 필요한 사실은 Read/Grep/Glob으로 코드를 읽어
   잡는다 — 지어내지 말고, 그래도 답이 안 나오면 `openQuestions`에 담는다.

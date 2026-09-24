@@ -166,7 +166,7 @@ init부터 안내한다.
 $S/sdd.py run "<기능 설명>" --path <root>
 ```
 
-응답의 `next.action`에 따라 아래를 **`done`·`halted`·`ask-user`·`approve`가 나올 때까지 반복한다**:
+응답의 `next.action`에 따라 아래를 **`done`·`halted`·`ask-user`·`approve`·`reflect`가 나올 때까지 반복한다**:
 
 | `action` | 할 일 |
 |---|---|
@@ -174,7 +174,8 @@ $S/sdd.py run "<기능 설명>" --path <root>
 | `call-agents` | 리뷰 단계. `agents[]`의 리뷰어를 **한 메시지에서 동시에** 호출한다 — 순차로 부르며 앞선 판정을 다음 리뷰어에게 알려주면 독립성이 깨진다. 각 결과에 **`agent` 키를 붙여** `advance --result '{"reviews": [...]}'`로 넘긴다(하나씩 따로 넘겨도 누적된다). `alreadyReported`에 있는 리뷰어는 다시 부르지 않는다. 종합 판정은 로스터 전원이 모였을 때 `advance`가 낸다. |
 | `ask-user` | `questions`를 사용자에게 그대로 묻는다. 답을 `advance --result '{"answers": {...}}'`로 넘기면 루프가 이어진다. |
 | `approve` | 사람 승인 지점(`gate`: `spec` 또는 `plan`). `path` 파일을 열어보라고 안내하고, `summary`(인수 기준·오류 케이스·범위 밖·가정·경고, 또는 태스크·파일·검증 커맨드)를 **그대로** 보여준 뒤 승인 여부를 묻는다. 승인이면 `advance --result '{"approve": true}'`, 고칠 점이 있으면 사용자의 말을 그대로 `advance --result '{"feedback": ["..."]}'`로 넘긴다 — 같은 역할이 다시 불려 반영하고, 다시 `approve`로 온다. |
-| `done` | 완료. 5단계(기록)로 간다. |
+| `reflect` | 리뷰 승인으로 완료됐고 **회고 단계**다. `facts`(되돌아간 횟수·막힌 내용·에이전트 호출 수)와 `retroPath`를 보고, 다음 기능에서 같은 실수를 덜 하려면 무엇을 규칙으로 남길지 **후보 0~3개**를 사용자에게 제안한다(`facts.clean`이면 0개가 정상). 사용자가 고른 것만 `$S/sdd.py learn --add "<교훈>" --spec <슬러그>`로 기록하고 `learn --done --spec <슬러그>`로 닫는다. 사용자가 원치 않으면 `learn --skip`. 교훈은 구체적 행동 규칙으로 쓴다("에러 응답에는 사용자용 메시지를 넣는다") — "더 꼼꼼히" 같은 다짐은 규칙이 아니다. |
+| `done` | 완료(회고까지 닫힘). 5단계(기록)로 간다. |
 | `halted` | `reason`과 `history`를 그대로 사용자에게 보고하고 멈춘다. 지어내서 우회하지 않는다. |
 | `init-required` / `none` | 각각 `/sdd:init`, `/sdd:run <설명>`을 안내한다. |
 
@@ -188,6 +189,8 @@ $S/sdd.py run "<기능 설명>" --path <root>
 - `advance`를 건너뛰고 다음 서브에이전트를 부르지 마라 — 그 순간 파이프라인이 제자리에 남는다.
 - 단계 사이에서 사용자에게 "계속할까요?"를 묻지 마라. 멈추는 건 `ask-user`·`approve`·`halted`뿐이다.
 - `approve`를 네 판단으로 통과시키지 마라. 요약이 괜찮아 보여도 사용자의 답을 받는다.
+- 회고 교훈을 사용자 확인 없이 `learn --add` 하지 마라. 쌓인 교훈은 이후 모든 에이전트의
+  컨텍스트에 실린다 — 잘못된 규칙 하나가 다음 기능 전부를 비튼다.
 - 재시도 횟수를 세지 마라. `attempts`/`maxAttempts`는 `advance`가 센다.
 - `waiting`에 있는 파이프라인을 억지로 돌리지 마라. 스케줄러가 페이즈 충돌이나 파일 겹침을
   이미 확인했다 — 우회하면 한쪽 작업이 사라지거나 게이트에 막힌다.
@@ -312,7 +315,9 @@ $S/sdd.py run --spec <슬러그> --from review --path <root>   # 명세·구현�
 ### 5단계: 기록
 
 작업이 끝나면 `$S/sdd.py status --path <root>`로 최종 상태를 한 번 더 확인하고 사용자에게
-요약한다(phase, 명세 목록, 리뷰 판정, 남은 게이트 위반, 파이프라인 라운드 수).
+요약한다(phase, 명세 목록, 리뷰 판정, 남은 게이트 위반, 파이프라인 라운드 수, 회고 대기
+`reflectPending`, 쌓인 교훈 수 `learnings`). 교훈 목록은 `$S/sdd.py learn --list`, 잘못된
+교훈은 `learn --remove LRN-N`으로 지운다.
 
 ## 참조 파일
 
