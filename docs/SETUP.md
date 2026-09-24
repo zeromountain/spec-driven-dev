@@ -135,6 +135,12 @@ Codex에는 슬래시 커맨드가 없으므로 **의도를 말로 전한다.** 
 `"humanGates": {"spec": false, "plan": false}`를 넣고, 한 번만 건너뛰려면
 `/sdd:run <설명> --no-gate`. 구현 계획(깊은 모드)도 승인받으려면 `"plan": true`.
 
+**v0.17.0부터 리뷰 승인 뒤 `done` 대신 `reflect`(회고)가 먼저 나온다.** 스크립트가 센
+재시도·막힌 내용을 보고 남길 교훈을 고르거나 건너뛰면(`sdd.py learn --done` / `--skip`)
+그때 `done`이 된다. 명세·체크박스·아카이브는 승인 시점에 이미 끝나 있으므로, 승인 직후의
+`action == "done"`을 기다리던 외부 스크립트는 `reflect`도 완료로 받거나 `learn --skip`을
+먼저 부르면 된다. 고른 교훈은 `docs/sdd/learnings.md`에 쌓이고 직접 고쳐도 된다.
+
 `init`은 다음을 만든다: `specs/`, `.sdd/state.json`(세션 로컬, gitignore됨),
 `.sdd/config.json`(팀 공유, 커밋됨), `.sdd/reviews/`, 프로젝트 지식 양식 `docs/sdd/prd.md`·
 `docs/sdd/architecture.md`·`docs/sdd/adr/_template.md`(없을 때만 — 채워 두면 모든 에이전트가

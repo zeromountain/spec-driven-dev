@@ -152,7 +152,7 @@ codex --plugin-dir ~/spec-driven-dev              # Codex CLI
 `run --from`) 자동으로 제자리로 돌아오고, 버전은 `spec-v2.md`로 이어진다.
 
 ```
-spec ──validate 통과──▶ (사람 승인) ──▶ implement ──테스트 통과──▶ review ──approved──▶ done
+spec ──validate 통과──▶ (사람 승인) ──▶ implement ──테스트 통과──▶ review ──approved──▶ reflect ──▶ done
  ▲                          │                        │
  └──specChangeRequests──────┘      changes-requested └──▶ implement (gaps 인계)
 ```
@@ -160,7 +160,9 @@ spec ──validate 통과──▶ (사람 승인) ──▶ implement ──�
 진행 위치는 `.sdd/state.json`의 `pipelines[<슬러그>]` 레코드에만 있으므로 세션이 끊기거나
 컨텍스트가 날아가도 `/sdd:run`을 인자 없이 다시 부르면 같은 자리에서 이어진다. 멈추는
 경우는 사람 승인(`approve` — 명세는 기본 켜짐, 구현 계획은 `humanGates.plan`으로 켠다),
-미결 질문(`ask-user`), 재시도 상한 초과(`halted`) 셋이다. 승인 지점을 이번 run에서만 건너뛰려면
+미결 질문(`ask-user`), 재시도 상한 초과(`halted`) 셋이다. 승인으로 끝나면 회고(`reflect`)에서
+스크립트가 센 재시도·막힌 내용을 보고 사람이 교훈을 고르며, 고른 교훈은
+`docs/sdd/learnings.md`에 쌓여 다음 기능의 모든 에이전트 컨텍스트에 실린다. 승인 지점을 이번 run에서만 건너뛰려면
 `--no-gate`. 단계별 상한은 기본
 2회, 전체 전이 상한은 24회다. 전이표·인계 항목·중단 사유는
 [`references/pipeline.md`](skills/spec-driven-dev/references/pipeline.md)에 있다.

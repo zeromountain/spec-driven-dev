@@ -32,7 +32,7 @@
 `.sdd/.gitignore`가 `state.json`을 제외하므로 이 레코드는 커밋되지 않는다 — 로컬 진행
 상태이지 공유 산출물이 아니다.
 
-## 세 개의 서브커맨드
+## 서브커맨드
 
 | 커맨드 | 하는 일 |
 |---|---|
@@ -40,6 +40,7 @@
 | `next` | **다음 행동 하나**를 지시한다. 부수효과(페이즈 전환·파일 생성)는 여기서 일어난다 |
 | `advance --result '<json>'` | 서브에이전트 결과를 받아 전이를 결정하고, 새 `next`를 함께 돌려준다 |
 | `abort --reason "<사유>"` | 진행 중인 파이프라인을 halted로 닫는다 |
+| `learn --add "<교훈>" / --list / --remove LRN-N / --done / --skip [--spec <슬러그>]` | 회고 교훈을 기록·조회·삭제하고 회고 단계를 닫는다 |
 
 `advance`의 응답에 이미 `next`가 들어 있으므로, 정상 루프에서 `next`를 따로 부를 일은
 재개할 때뿐이다.
@@ -51,7 +52,8 @@
 | `call-agent` | 서브에이전트 한 번 호출 | `agent`·`instruction`·`context`를 그대로 전달, 결과를 `advance`에 |
 | `ask-user` | 명세 단계에서 미결 질문 발생 | `questions`를 묻고 `{"answers": {...}}`로 `advance` |
 | `approve` | 사람 승인 지점 (`gate: spec` 또는 `plan`) | `path`·`summary`를 보여주고 `{"approve": true}` 또는 `{"feedback": [...]}`로 `advance`. **대신 승인하지 않는다** |
-| `done` | 리뷰 승인으로 완료 | 결과 요약 보고 |
+| `reflect` | 리뷰 승인 직후 회고 대기 (`status: done`, `reflect: pending`) | `facts`로 교훈 후보를 제안 → 사용자가 고른 것만 `learn --add` → `learn --done` (또는 `--skip`) |
+| `done` | 리뷰 승인으로 완료 (회고까지 닫힘) | 결과 요약 보고 |
 | `halted` | 재시도 상한·수렴 실패·판정 불가 | `reason`을 그대로 보고하고 멈춤 |
 | `none` | 파이프라인 없음 | `run "<설명>"` 안내 |
 | `init-required` | `.sdd/state.json` 없음 | `/sdd:init` 안내 |
@@ -76,6 +78,28 @@
 | review | `verdict: approved` | 명세·`tasks.md`의 남은 `- [ ]` 를 전부 채우고, `status: done` 기록, 디렉터리째 `specs/archive/<슬러그>/` 로 이동, `activeSpec` 해제, `phase: off`, `status: done` |
 | review | `verdict: changes-requested` | `attempts.review++`, `gaps`를 넘겨 → implement. 상한 초과 시 halted |
 | review | verdict 판독 불가 | halted |
+
+### 회고와 학습 루프
+
+리뷰가 승인되면 체크박스·`status: done`을 쓴 뒤, **아카이브로 옮기기 직전에** 명세
+디렉터리에 `retro-v<N>.md`를 쓴다(그래서 이동과 함께 `specs/archive/<슬러그>/`로 간다).
+파이프라인은 `status: done`이 되지만 `reflect: pending`이라 `next`는 `done` 대신 `reflect`를
+낸다.
+
+- **사실은 스크립트가 센다.** `_record`는 이벤트마다 `pipe.stats`를 누적하고(`history`가
+  `MAX_HISTORY`로 잘려도 안 사라진다), 막힌 내용은 `_note`가 `pipe.retroNotes`에 항목별
+  최근 10개까지 모은다(검증 오류·미결 질문·사람 피드백·명세 변경 요청·테스트/검증 실패·
+  리뷰 갭·멈춘 이유). 에이전트 호출 수는 `advance`가 결과를 받을 때 `pipe.calls`에 센다 —
+  `next`는 멱등이라 거기서 세면 두 번 불린 `next`가 호출로 잡힌다.
+- **교훈은 사람이 고른다.** 메인 세션이 후보를 제안하고, 사용자가 고른 것만
+  `learn --add`로 `docs/sdd/learnings.md`(`config.learningsPath`)에 `LRN-N`으로 쌓인다.
+  번호는 지워도 재사용하지 않는다.
+- **루프가 닫히는 곳.** 모든 단계의 `next`가 최근 20개 교훈을 `context.learnings`로 싣고,
+  instruction에 "어기지 마라"를 덧붙인다(Codex에도 닿게).
+- `learn --done`은 이 기능에서 나온 교훈을 retro 파일의 `기록된 교훈`에 덧붙이고
+  `reflect: done`으로 닫는다. 회고 대기는 `live`가 아니라 다른 파이프라인을 막지 않으며,
+  `next --all`의 `round[]`에 `reflect`로 함께 실린다. `run --from`으로 다시 열면 회고 대기는
+  지워진다.
 
 ### 사람 승인 지점 (`humanGates`)
 

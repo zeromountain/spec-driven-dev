@@ -74,6 +74,11 @@ tools: Read, Grep, Glob, Edit, Bash
 `context.contextDocs`의 아키텍처·ADR 문서를 먼저 읽고 거기 적힌 패턴·결정을
 `patternsToFollow`의 근거로 삼는다(`unfilled: true`는 빈 양식이니 제외).
 `parentSpecPath`가 있으면 상위 명세의 인터페이스와 어긋나지 않게 계획한다.
+`userFeedback`이 있으면 사람이 직전 계획을 보고 준 지적이다 — `plan`(직전 계획)을 고쳐
+전부 반영한다.
+
+`context.learnings`는 이 프로젝트가 과거 파이프라인의 실패에서 얻은 규칙(`LRN-N: ...`)이다 —
+사람이 회고에서 고른 것이니 어기지 않는다.
 
 ## 출력 방식
 

@@ -13,6 +13,8 @@
 | `review-report.md` | `sdd.py review-report <slug>` | `.sdd/reviews/<slug>-v<N>-<seq>.md` |
 | `AGENTS.sdd.md` | `sdd.py init` | 프로젝트 `AGENTS.md`의 한 섹션 |
 | `prd.md` · `architecture.md` · `adr.md` | `sdd.py init` (없을 때만) | `docs/sdd/prd.md` · `docs/sdd/architecture.md` · `docs/sdd/adr/_template.md` |
+| `retro.md` | 리뷰 승인 시 `advance`가 | `specs/archive/<slug>/retro-v<N>.md` |
+| (헤더 내장) | `sdd.py learn --add` 첫 호출 | `docs/sdd/learnings.md` |
 
 ## 스크립트가 미리 채워 주는 것
 
@@ -46,8 +48,9 @@
 ├── docs/sdd/          # 프로젝트 지식 (contextDocs) — 없을 때만 양식 생성
 │   ├── prd.md
 │   ├── architecture.md
-│   └── adr/
-│       └── _template.md
+│   ├── adr/
+│   │   └── _template.md
+│   └── learnings.md   # 회고에서 고른 교훈 (LRN-N) — 첫 learn --add 때 생성
 ├── specs/
 │   ├── README.md
 │   ├── <slug>/            # 진행 중
@@ -56,7 +59,8 @@
 │   └── archive/            # 리뷰 승인으로 완료된 것 (디렉터리째 이동)
 │       └── <slug>/
 │           ├── spec-v<N>.md
-│           └── tasks.md
+│           ├── tasks.md
+│           └── retro-v<N>.md   # 회고 사실 + 기록된 교훈
 └── .sdd/
     ├── state.json      # 세션 로컬 (gitignore) — pipelines 레지스트리가 여기 산다
     ├── config.json     # 팀 공유 (커밋)

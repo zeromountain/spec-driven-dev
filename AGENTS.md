@@ -46,7 +46,7 @@ spec-driven-dev/
 ├── agents/                  # 6 role-bound subagents (see above) — Claude Code only
 ├── hooks/                   # phase_gate.py + hooks.json (opt-in per project) — Claude Code only
 ├── scripts/                 # sdd.py (stdlib-only CLI) + tests/ (both hosts)
-├── templates/                # scaffolded artifacts (spec.md, tasks.md, review-report.md, AGENTS.sdd.md, prd.md, architecture.md, adr.md)
+├── templates/                # scaffolded artifacts (spec.md, tasks.md, review-report.md, AGENTS.sdd.md, prd.md, architecture.md, adr.md, retro.md)
 └── docs/SETUP.md            # install/verify/troubleshoot guide for both hosts
 ```
 
@@ -159,6 +159,16 @@ Keep the two manifests' `version` fields in lockstep — `scripts/validate.py` e
   (`approvedSpecVersion`), so a new version or `--from spec` asks again. Feedback reruns
   the same role on the same file and does not spend `attempts`. `run --no-gate` is the
   only bypass and must come from the user; it also releases an approval already pending.
+- **Retro facts are counted; lessons are chosen.** On approval `_advance_review` writes
+  `retro-v<N>.md` into the spec dir *before* `archive_spec_dir` so it moves with it, and
+  sets `pipe.reflect = "pending"`; `compute_next` then yields `action: "reflect"`
+  instead of `done`. Counts come from `pipe.stats` (bumped in `_record`, immune to the
+  `MAX_HISTORY` trim), details from `pipe.retroNotes` (`_note`, capped), agent calls from
+  `pipe.calls` (bumped in `cmd_advance`, never in idempotent `next`). Lessons enter
+  `learningsPath` only via `learn --add` after the user picks them; every stage's context
+  carries the latest `LEARNINGS_IN_CONTEXT` as `context.learnings`, plus an instruction
+  clause so Codex sees it. IDs are never reused. A reflect-pending pipeline is `done`, so
+  it is not live and never blocks scheduling.
 - **Verify commands fail closed.** `impl-planner`'s `tasks[].verify` becomes
   `planned_verifies()`; `_failed_verifies()` counts non-zero exit codes *and* planned
   commands the engineer didn't report. Failures share the `attempts.implement` budget

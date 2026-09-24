@@ -100,7 +100,8 @@ tools: Read, Grep, Glob, Bash
 
 `context.contextDocs`에 프로젝트 지식 문서(PRD·아키텍처·ADR) 경로가 있다. 이 프로젝트가
 이미 정한 관례·결정을 확인할 때 읽는다. `unfilled: true`인 문서는 아직 빈 양식이니
-근거로 쓰지 않는다.
+근거로 쓰지 않는다. `context.learnings`(과거 회고에서 사람이 고른 규칙, `LRN-N`)를 어긴
+변경은 자기 관심사 안에서 지적한다.
 
 ## 출력 방식
 
