@@ -40,6 +40,19 @@ REQUIRED_SECTIONS = [
     "범위 밖",
 ]
 
+# 영상/실무에서 말하는 "좋은 스펙"의 요소 중 기존 8개 섹션에 없던 둘. 필수로 올리면
+# 이미 있는 명세와 아카이브가 전부 검증에 실패하므로 경고로만 요구한다.
+RECOMMENDED_SECTIONS = ["입력과 출력", "인터페이스"]
+# 인수 기준이 이만큼 많으면 한 세션 컨텍스트에 담기 어렵다 — 컴포넌트 명세로 쪼갤 신호.
+SPEC_SPLIT_AC_COUNT = 15
+# 깊이 판정(warningCount)에서 빼는 경고. 명세의 "모호함"이 아니라 형식·크기에 관한
+# 경고라서, 세면 옛 명세가 권장 섹션 누락만으로 deep 이 되어 버린다.
+DEPTH_EXEMPT_WARNING_CODES = frozenset({"recommended-section-missing", "spec-too-large"})
+# contextDocs 를 어떻게 다룰지는 agents/*.md 에도 있지만 그건 Claude Code 전용이다 —
+# Codex 까지 닿으려면 next 의 instruction 에 실려야 한다.
+CONTEXT_DOCS_CLAUSE = (" contextDocs의 프로젝트 문서(PRD·아키텍처·ADR)를 먼저 읽어라 — "
+                       "unfilled: true 인 문서는 빈 양식이니 근거로 쓰지 마라.")
+
 DEFAULT_CONFIG = {
     "version": 1,
     "specsDir": "specs",
@@ -52,6 +65,9 @@ DEFAULT_CONFIG = {
     "worktrees": False,
     "worktreesDir": ".sdd/worktrees",
     "worktreeBranchPrefix": "sdd/",
+    # 명세보다 위에 있는 프로젝트 지식(PRD·아키텍처·ADR). 경로만 에이전트 컨텍스트에
+    # 실리고 본문은 에이전트가 직접 읽는다. 디렉터리면 그 안의 *.md 전부.
+    "contextDocs": ["docs/sdd/prd.md", "docs/sdd/architecture.md", "docs/sdd/adr"],
 }
 
 DEFAULT_STATE = {
@@ -139,7 +155,7 @@ SPECS_README = """# specs/
 `specs/<slug>/spec-v<N>.md`로 버전 관리되며, `sdd` 플러그인의 `spec-architect`
 서브에이전트만 이 디렉터리에 쓴다.
 
-- 명세는 8개 섹션을 모두 포함하고, 인수 기준은 `AC-1`부터, 오류 케이스는 `EC-1`부터
+- 명세는 필수 8개 섹션을 모두 포함하고(권장 섹션 `입력과 출력`·`인터페이스`는 없으면 경고), 인수 기준은 `AC-1`부터, 오류 케이스는 `EC-1`부터
   연속된 ID를 갖는다.
 - 동작이 바뀌면 새 버전(`spec-v<N+1>.md`)을 만든다. 오탈자·명확화는 제자리에서 고친다.
 - 리뷰가 승인되면 남은 체크박스가 모두 채워지고 디렉터리째 `specs/archive/<slug>/`로
@@ -474,6 +490,42 @@ def _validate_frontmatter(text: str, path, errors: list):
             })
 
 
+def spec_root_of(spec_path: Path) -> Path:
+    """`<specsDir>/<slug>/spec-vN.md` 또는 `<specsDir>/archive/<slug>/spec-vN.md` 에서
+    `<specsDir>` 를 찾는다."""
+    root = spec_path.parent.parent
+    return root.parent if root.name == ARCHIVE_DIRNAME else root
+
+
+def locate_spec(specs_dir: Path, slug: str):
+    """슬러그의 최신 명세 경로를 본체 → 아카이브 순으로 찾는다. 없으면 None.
+
+    `find_latest_version` 은 본체만 본다(아카이브를 보게 하면 안 된다 — AGENTS.md).
+    아카이브까지 봐야 하는 조회는 이 함수를 쓴다."""
+    for base in (specs_dir, specs_dir / ARCHIVE_DIRNAME):
+        version = find_latest_version(base, slug)
+        if version:
+            return base / slug / f"spec-v{version}.md"
+    return None
+
+
+def _validate_parent(text: str, path: Path, warnings: list) -> None:
+    fields, err = parse_frontmatter(text)
+    parent = ((fields or {}).get("parent") or "").strip("'\"") if not err else ""
+    if not parent:
+        return
+    parent = unicodedata.normalize("NFC", parent)
+    if parent == unicodedata.normalize("NFC", path.parent.name):
+        warnings.append({"section": "frontmatter", "code": "parent-missing",
+                         "message": f"parent='{parent}' 가 자기 자신이다"})
+        return
+    specs_dir = spec_root_of(path)
+    if specs_dir.exists() and locate_spec(specs_dir, parent) is None:
+        warnings.append({"section": "frontmatter", "code": "parent-missing",
+                         "message": f"parent='{parent}' 명세를 찾을 수 없다 "
+                                    "(본체·아카이브 모두 없음)"})
+
+
 def validate_spec(text: str, path=None) -> dict:
     """명세 구조를 검증한다.
 
@@ -518,6 +570,21 @@ def validate_spec(text: str, path=None) -> dict:
 
     if "범위 밖" in sections and not sections["범위 밖"].strip():
         warnings.append({"section": "범위 밖", "message": "범위 밖 섹션이 비어 있다"})
+
+    for name in RECOMMENDED_SECTIONS:
+        if name not in sections:
+            warnings.append({"section": name, "code": "recommended-section-missing",
+                             "message": f"권장 섹션 '## {name}'이 없다"})
+
+    if len(ac_ids) >= SPEC_SPLIT_AC_COUNT:
+        warnings.append({
+            "section": "인수 기준", "code": "spec-too-large",
+            "message": f"인수 기준이 {len(ac_ids)}개다 — 한 세션에 담기 어려운 크기다. "
+                       "상위 명세 아래 컴포넌트 명세(frontmatter `parent`)로 쪼개라",
+        })
+
+    if path is not None:
+        _validate_parent(text, Path(path), warnings)
 
     return {
         "valid": len(errors) == 0,
@@ -628,7 +695,8 @@ def decide_depth(spec_text=None, feature_text=None, force=None) -> dict:
         v = validate_spec(spec_text)
         ac_count = len(v["acIds"])
         ec_count = len(v["ecIds"])
-        warning_count = len(v["warnings"])
+        warning_count = sum(1 for w in v["warnings"]
+                            if w.get("code") not in DEPTH_EXEMPT_WARNING_CODES)
 
     security_hits = sorted({m.group(0) for m in SECURITY_HINT_RE.finditer(haystack)})
     perf_hits = sorted({m.group(0) for m in PERF_HINT_RE.finditer(haystack)})
@@ -1093,6 +1161,18 @@ def cmd_init(args) -> dict:
     else:
         skipped.append(str(gitignore_path.relative_to(root)))
 
+    # 프로젝트 지식 문서 양식 — 없을 때만 만든다(사람이 쓴 문서를 덮어쓰지 않는다).
+    docs_dir = root / "docs" / "sdd"
+    for rel, template in (("prd.md", "prd.md"), ("architecture.md", "architecture.md"),
+                          ("adr/_template.md", "adr.md")):
+        target = docs_dir / rel
+        existed = target.exists()
+        if not existed:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text((TEMPLATES_DIR / template).read_text(encoding="utf-8"),
+                              encoding="utf-8")
+        track(target, existed)
+
     agents_result = merge_agents_md(root)
     cfg_now = load_config(root)
     if cfg_now.get("worktrees"):
@@ -1195,7 +1275,8 @@ def cmd_tasks(args) -> dict:
     return ensure_tasks(root, resolve_slug(root, getattr(args, "slug", None)))
 
 
-def build_review_report(root: Path, slug, force=None, workdir=None) -> dict:
+def build_review_report(root: Path, slug, force=None, workdir=None,
+                        verify_results=None) -> dict:
     """trace·depth 결과를 반영한 리뷰 리포트 골격을 .sdd/reviews/ 에 만든다."""
     config = load_config(root)
     specs_dir = root / config["specsDir"]
@@ -1224,6 +1305,15 @@ def build_review_report(root: Path, slug, force=None, workdir=None) -> dict:
     ec_rows = "\n".join(f"| {ec} | {{{{✅/❌}}}} | {{{{비고}}}} |" for ec in v["ecIds"]) \
         or "| — | — | 오류 케이스 없음 |"
     ec_table = "| EC | 처리됨 | 비고 |\n|---|---|---|\n" + ec_rows
+
+    verify_rows = "\n".join(
+        f"| {r.get('task') or '—'} | `{r.get('command') or '—'}` | "
+        f"{'✅' if _exit_code(r.get('exitCode')) == 0 else '❌'} {r.get('exitCode')} |"
+        for r in (verify_results or []) if isinstance(r, dict)
+    )
+    verify_table = ("| 태스크 | 커맨드 | 결과 (exit code) |\n|---|---|---|\n" + verify_rows
+                    if verify_rows else
+                    "- 계획에 검증 커맨드가 없었다 (경량 모드이거나 impl-planner가 정하지 않음)")
 
     state = load_state(root)
     violations = guard_violations(git_changed_files(scan_root),
@@ -1264,6 +1354,7 @@ def build_review_report(root: Path, slug, force=None, workdir=None) -> dict:
         "acRows": ac_table,
         "ecRows": ec_table,
         "guardRows": guard_rows,
+        "verifyRows": verify_table,
         "codeReviewSection": section_for("code-reviewer", "가독성·복잡도·중복·에러 처리"),
         "securityReviewSection": section_for("security-reviewer", "입력 검증·인가·시크릿"),
         "perfReviewSection": section_for("perf-reviewer", "N+1·복잡도·경계 없는 로딩"),
@@ -1358,6 +1449,52 @@ def list_specs(root: Path) -> dict:
 
 def cmd_list(args) -> dict:
     return list_specs(Path(args.path).resolve())
+
+
+def context_docs(root: Path, config=None) -> list:
+    """`contextDocs` 에 등록된 프로젝트 지식 문서 중 실제로 있는 것의 목록.
+
+    본문은 싣지 않는다 — 경로만 넘기고 에이전트가 Read 로 읽는다. 그래야 문서가 커져도
+    `next` 응답 크기가 문서 수에만 비례한다. 템플릿 플레이스홀더가 남은 문서는
+    `unfilled` 로 표시해 에이전트가 빈 양식을 사실로 받아들이지 않게 한다.
+    디렉터리 안에서 `_` 로 시작하는 파일(ADR 양식 등)은 문서가 아니라 양식이라 뺀다."""
+    config = config or load_config(root)
+    out, seen = [], set()
+    for entry in config.get("contextDocs") or []:
+        target = root / entry
+        if target.is_dir():
+            files = sorted(f for f in target.glob("*.md") if not f.name.startswith("_"))
+        elif target.is_file():
+            files = [target]
+        else:
+            continue
+        for f in files:
+            rel = _rel(root, f)
+            if rel in seen:
+                continue
+            seen.add(rel)
+            try:
+                text = f.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            out.append({"path": rel, "unfilled": bool(PLACEHOLDER_RE.search(text))})
+    return out
+
+
+def parent_spec_path(root: Path, spec_rel, config=None):
+    """명세 frontmatter 의 `parent` 가 가리키는 상위 명세의 경로 (본체 → 아카이브). 없으면 None."""
+    if not spec_rel:
+        return None
+    spec_path = root / spec_rel
+    if not spec_path.is_file():
+        return None
+    fields, err = parse_frontmatter(spec_path.read_text(encoding="utf-8"))
+    parent = ((fields or {}).get("parent") or "").strip("'\"") if not err else ""
+    if not parent or PLACEHOLDER_RE.search(parent):
+        return None
+    config = config or load_config(root)
+    found = locate_spec(root / config["specsDir"], unicodedata.normalize("NFC", parent))
+    return _rel(root, found) if found else None
 
 
 def cmd_status(args) -> dict:
@@ -1508,6 +1645,8 @@ RESULT_SCHEMA = {
     "software-engineer": {
         "filesChanged": "[string] — 리뷰어에게 전달된다",
         "testResult": {"passed": "int", "failed": "int", "raw": "string — 실패 시 핵심 출력"},
+        "verifyResults": "[{task, command, exitCode}] — plan.tasks[].verify 실행 결과. "
+                         "0이 아니거나 빠진 커맨드가 있으면 구현 재시도",
         "specChangeRequests": "[string] — 있으면 spec 단계로 되돌아가 새 버전을 만든다",
     },
     "_reviewer": {
@@ -1581,6 +1720,8 @@ def _new_pipeline(feature: str, slug: str, max_attempts: int) -> dict:
             "specChangeRequests": [],
             "testResult": None,
             "testFailures": None,
+            "verifyResults": [],
+            "verifyFailures": None,
             "reviewGaps": [],
             "implementNotes": None,
             "plan": None,
@@ -2283,6 +2424,8 @@ def _next_spec(root: Path, pipe: dict) -> dict:
         # 완료된 기능이야말로 새 기능과 충돌할 가능성이 가장 높다 — 아카이브됐다고
         # 아키텍트 시야에서 지우면 안 된다.
         "archivedSpecs": listing["archived"],
+        "contextDocs": context_docs(root, config),
+        "parentSpecPath": parent_spec_path(root, pipe["specPath"], config),
     }
     if context["validateErrors"]:
         instruction = ("직전 명세가 검증에 실패했다. validateErrors를 전부 해소하도록 "
@@ -2293,6 +2436,10 @@ def _next_spec(root: Path, pipe: dict) -> dict:
     else:
         instruction = ("existingSpecs·archivedSpecs와 기존 코드를 직접 조사해 근거를 잡은 "
                        "뒤 specPath 파일의 모든 플레이스홀더를 채워 기능 명세를 완성하라.")
+
+    instruction += CONTEXT_DOCS_CLAUSE
+    if context["parentSpecPath"]:
+        instruction += " parentSpecPath의 상위 명세와 범위·용어를 맞춰라."
 
     _persist_pipeline(root, pipe)
     return _call_agent(pipe, "spec", context, instruction, phase)
@@ -2328,11 +2475,14 @@ def _next_implement(root: Path, pipe: dict) -> dict:
         "workdir": str(pipeline_workdir(root, pipe)),
         "worktree": worktree_of(pipe) or None,
         "previousTestFailures": carry.get("testFailures"),
+        "previousVerifyFailures": carry.get("verifyFailures"),
         "reviewGaps": carry.get("reviewGaps") or [],
         "lastReviewPath": pipe.get("lastReviewPath"),
         "reviewRound": pipe["attempts"].get("review", 0),
         "plan": carry.get("plan"),
         "filesChanged": carry.get("filesChanged") or [],
+        "contextDocs": context_docs(root, config),
+        "parentSpecPath": parent_spec_path(root, pipe["specPath"], config),
     }
     agent = current_agent(pipe)
 
@@ -2343,15 +2493,26 @@ def _next_implement(root: Path, pipe: dict) -> dict:
     elif context["reviewGaps"]:
         instruction = ("리뷰가 changes-requested를 냈다. reviewGaps 항목을 하나도 남기지 말고 "
                        "고쳐라. lastReviewPath에 리뷰 리포트 전문이 있다.")
-    elif context["previousTestFailures"]:
-        instruction = ("직전 시도의 테스트가 실패했다. previousTestFailures를 보고 **가설을 바꿔서** "
-                       "고쳐라 — 같은 시도를 반복하지 마라.")
+    elif context["previousTestFailures"] or context["previousVerifyFailures"]:
+        instruction = ("직전 시도의 테스트 또는 검증 커맨드가 실패했다. previousTestFailures·"
+                       "previousVerifyFailures를 보고 **가설을 바꿔서** 고쳐라 — 같은 시도를 "
+                       "반복하지 마라.")
     elif context["plan"]:
         instruction = ("plan을 따라 명세의 인수 기준을 구현하고, AC별 최소 1개 테스트를 "
                        "acPattern 태그와 함께 작성한 뒤 실제로 실행하라.")
     else:
         instruction = ("명세의 인수 기준을 구현하고, AC별 최소 1개 테스트를 "
                        "acPattern 태그와 함께 작성한 뒤 실제로 실행하라.")
+
+    instruction += CONTEXT_DOCS_CLAUSE
+    if context["parentSpecPath"]:
+        instruction += " parentSpecPath의 상위 명세 인터페이스를 지켜라."
+    if agent == "impl-planner":
+        instruction += (" 태스크마다 exit code 0이면 해당 AC 충족이 확인되는 verify 커맨드를 "
+                        "실제 존재하는 러너로 정하라.")
+    if agent != "impl-planner" and planned_verifies(pipe):
+        instruction += (" 끝나기 전에 plan.tasks[].verify 커맨드를 전부 실제로 실행하고 "
+                        "verifyResults로 보고하라 — 보고가 빠진 커맨드는 실패로 센다.")
 
     _persist_pipeline(root, pipe)
     return _call_agent(pipe, "implement", context, instruction, phase)
@@ -2373,7 +2534,8 @@ def _next_review(root: Path, pipe: dict) -> dict:
 
     if not pipe.get("reviewPath"):
         rep = build_review_report(root, pipe["slug"], force=pipe.get("forcedDepth"),
-                                  workdir=pipeline_workdir(root, pipe))
+                                  workdir=pipeline_workdir(root, pipe),
+                                  verify_results=pipe["carry"].get("verifyResults"))
         if not rep.get("created"):
             _halt(pipe, "리뷰 리포트를 만들지 못했다: " + str(rep.get("reason")))
             _persist_pipeline(root, pipe)
@@ -2403,11 +2565,13 @@ def _next_review(root: Path, pipe: dict) -> dict:
         "round": pipe["attempts"].get("review", 0) + 1,
     }
     context["filesChanged"] = carry.get("filesChanged") or []
+    context["contextDocs"] = context_docs(root, config)
     instruction = ("각자 자기 관심사만으로 reviewPath 리포트의 해당 절을 채우고 판정을 "
                    "내려라. 관심사가 겹치면 판정에 넣지 말고 handoffs로 넘긴다. "
                    "coverage·uncovered·guardViolations는 이미 측정된 값이니 다시 계산하지 마라.")
     if context["previousGaps"]:
         instruction += " previousGaps가 실제로 해소됐는지 먼저 확인하라."
+    instruction += CONTEXT_DOCS_CLAUSE
 
     _persist_pipeline(root, pipe)
     return _call_reviewers(pipe, context, instruction, phase)
@@ -2476,6 +2640,7 @@ def _advance_implement(root: Path, pipe: dict, result: dict) -> None:
     if changes:
         carry["specChangeRequests"] = changes
         carry["testFailures"] = None
+        carry["verifyFailures"] = None
         pipe["attempts"]["specRevision"] += 1
         _record(pipe, "spec-change-requested", count=len(changes),
                 attempt=pipe["attempts"]["specRevision"])
@@ -2493,17 +2658,26 @@ def _advance_implement(root: Path, pipe: dict, result: dict) -> None:
     carry["testResult"] = tr
     carry["implementNotes"] = result.get("notes")
     failed = _failed_count(tr)
+    reported = result.get("verifyResults") or []
+    carry["verifyResults"] = [r for r in reported if isinstance(r, dict)]
+    vfailed = _failed_verifies(planned_verifies(pipe), carry["verifyResults"])
 
-    if failed:
-        carry["testFailures"] = tr
+    if failed or vfailed:
+        # 테스트와 검증 커맨드는 따로 싣는다 — 테스트는 통과했는데 검증만 실패했을 때
+        # testFailures 에 통과한 결과를 실으면 재시도한 구현자가 실패를 못 본다.
+        carry["testFailures"] = tr if failed else None
+        carry["verifyFailures"] = vfailed or None
         pipe["attempts"]["implement"] += 1
-        _record(pipe, "tests-failed", failed=failed, attempt=pipe["attempts"]["implement"])
+        _record(pipe, "tests-failed", failed=failed or 0, verifyFailed=len(vfailed),
+                attempt=pipe["attempts"]["implement"])
         if pipe["attempts"]["implement"] > pipe["maxAttempts"]:
-            _halt(pipe, f"테스트 실패가 {pipe['attempts']['implement']}회 이어졌다 "
-                        f"(마지막: {failed}개 실패) — 사용자 판단이 필요하다")
+            _halt(pipe, f"테스트·검증 실패가 {pipe['attempts']['implement']}회 이어졌다 "
+                        f"(마지막: 테스트 {failed or 0}개, 검증 커맨드 {len(vfailed)}개 실패) "
+                        "— 사용자 판단이 필요하다")
         return
 
     carry["testFailures"] = None
+    carry["verifyFailures"] = None
     carry["reviewGaps"] = []
     carry["filesChanged"] = result.get("filesChanged") or carry.get("filesChanged") or []
     pipe["attempts"]["implement"] = 0
@@ -2512,6 +2686,48 @@ def _advance_implement(root: Path, pipe: dict, result: dict) -> None:
     if _advance_agent(pipe):
         return
     _enter_stage(pipe, "review")
+
+
+def planned_verifies(pipe: dict) -> list:
+    """impl-planner 가 계획에 넣은 검증 커맨드 [{task, command}]. 없으면 빈 리스트."""
+    plan = (pipe.get("carry") or {}).get("plan") or {}
+    out = []
+    for t in plan.get("tasks") or []:
+        if isinstance(t, dict) and isinstance(t.get("verify"), str) and t["verify"].strip():
+            out.append({"task": t.get("id"), "command": t["verify"].strip()})
+    return out
+
+
+def _exit_code(value):
+    """"0" 처럼 문자열로 온 exit code 도 정수로 읽는다. 읽을 수 없으면 None(실패로 센다)."""
+    if isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _failed_verifies(planned, reported) -> list:
+    """실패한 검증 커맨드. exit code 가 0 이 아니거나 계획에 있는데 보고되지 않은 것.
+
+    보고 누락을 실패로 세는 이유: 그러지 않으면 "안 돌렸다"와 "돌려서 통과했다"가
+    같아진다. 커맨드 문자열로 맞춘다 — 태스크 ID 는 구현자가 바꿔 적기 쉽다."""
+    failed = []
+    by_command = {}
+    for r in reported:
+        cmd = str(r.get("command") or "").strip()
+        if cmd:
+            by_command[cmd] = r
+        code = _exit_code(r.get("exitCode"))
+        if code != 0:
+            failed.append({"task": r.get("task"), "command": cmd or None, "exitCode": code,
+                           "output": r.get("output") or r.get("raw")})
+    for p in planned:
+        if p["command"] not in by_command:
+            failed.append({"task": p["task"], "command": p["command"], "exitCode": None,
+                           "output": "실행 보고 없음"})
+    return failed
 
 
 def _failed_count(tr):
@@ -2719,6 +2935,7 @@ def reopen_pipeline(root: Path, pipe: dict, stage: str, depth=None) -> dict:
     elif stage == "implement":
         pipe["attempts"]["implement"] = 0
         pipe["carry"]["testFailures"] = None
+        pipe["carry"]["verifyFailures"] = None
     else:
         pipe["attempts"]["spec"] = 0
 

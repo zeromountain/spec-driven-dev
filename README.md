@@ -15,8 +15,8 @@ AI로 코드를 빨리 만들 수는 있지만, 그럴수록 "일단 되게 만�
 
 | 페이즈 | 에이전트 | 하는 일 | 쓰기 |
 |---|---|---|---|
-| spec | **`spec-architect`** | 조사(기존 코드·명세) + 8섹션 명세 작성 + 스스로 적대적 재검토 | `specs/` |
-| implement | `impl-planner` | AC → 태스크 분해, 영향 파일·패턴 확정 | `tasks.md` |
+| spec | **`spec-architect`** | 조사(기존 코드·명세·`docs/sdd/`) + 명세 작성(필수 8 + 권장 2섹션) + 스스로 적대적 재검토 | `specs/` |
+| implement | `impl-planner` | AC → 태스크 분해, 영향 파일·패턴·태스크별 검증 커맨드 확정 | `tasks.md` |
 | implement | **`software-engineer`** | 구현 + AC별 테스트 작성·실행 | `src/`, `tests/` |
 | review | **`code-reviewer`** | 가독성·복잡도·중복·에러 처리 | 없음 |
 | review | `security-reviewer` | 입력 검증·인가·시크릿·인젝션 | 없음 |
@@ -126,7 +126,7 @@ codex --plugin-dir ~/spec-driven-dev              # Codex CLI
 
 **Claude Code** — 슬래시 커맨드 9개:
 ```
-/sdd:init                                  # specs/·AGENTS.md·.sdd/ 스캐폴딩
+/sdd:init                                  # specs/·docs/sdd/·AGENTS.md·.sdd/ 스캐폴딩
 /sdd:run 사용자 엔티티에 결혼여부 필드 추가    # 명세→구현→리뷰를 끝까지 자동으로
 /sdd:run                                   # 중단된 파이프라인을 그 자리에서 재개
 /sdd:board                                 # 살아 있는 파이프라인 전부의 현황
@@ -208,8 +208,10 @@ Code에서만 동작한다 — Codex 플러그인은 훅을 지원하지 않으�
 
 ## 데이터
 
-모든 상태·설정은 대상 프로젝트의 `.sdd/`와 `specs/` 아래에 쌓인다. 자세한 스키마는
-`skills/spec-driven-dev/references/spec-format.md`, `phase-gate.md`를 본다.
+모든 상태·설정은 대상 프로젝트의 `.sdd/`와 `specs/` 아래에 쌓인다. 명세보다 위에 있는
+프로젝트 지식(PRD·아키텍처·ADR)은 `docs/sdd/`에 두면 모든 에이전트의 컨텍스트에 경로로
+실린다(`.sdd/config.json`의 `contextDocs`). 자세한 스키마는
+`skills/spec-driven-dev/references/spec-format.md`, `templates.md`, `phase-gate.md`를 본다.
 
 ## 개발
 
