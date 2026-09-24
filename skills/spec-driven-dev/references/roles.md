@@ -27,8 +27,8 @@ SDD 하네스는 하나의 책임을 페이즈 3개 × 역할 6개로 쪼갠다.
 
 | 역할 | 쓰기 | 받는 것 | 내는 것 |
 |---|---|---|---|
-| `impl-planner` | `specs/<slug>/tasks.md` | 명세 경로, `sdd.py tasks` | `tasks[]`, `patternsToFollow`, `testRunner` |
-| **`software-engineer`** | `src/`, `tests/` | 명세 경로, (있으면) 계획 JSON | `filesChanged`, `testResult`, `specChangeRequests` |
+| `impl-planner` | `specs/<slug>/tasks.md` | 명세 경로, `sdd.py tasks` | `tasks[]`(태스크별 `verify` 커맨드 포함), `patternsToFollow`, `testRunner` |
+| **`software-engineer`** | `src/`, `tests/` | 명세 경로, (있으면) 계획 JSON | `filesChanged`, `testResult`, `verifyResults`, `specChangeRequests` |
 
 - 구현 전 반드시 명세를 읽고 `validate`로 구조를 확인한다.
 - 인수 기준 없는 동작을 구현하지 않는다.
@@ -61,6 +61,13 @@ SDD 하네스는 하나의 책임을 페이즈 3개 × 역할 6개로 쪼갠다.
   한 줄짜리 인증 수정에도 보안 리뷰는 돈다. 신호가 없으면 `code-reviewer` 혼자
   review 단계를 끝낸다.
 - 리뷰어들은 **서로의 판정을 보지 않는다.** 오케스트레이터가 한 메시지에서 동시에 부른다.
+
+## 모든 역할이 공통으로 받는 것
+
+- `contextDocs` — 프로젝트 지식 문서(PRD·아키텍처·ADR, `docs/sdd/`). 사람이 머릿속에
+  두던 관례·결정을 에이전트가 추측하지 않게 하는 채널이다. 경로만 실리고 본문은 각자
+  읽는다. `unfilled: true`인 문서는 빈 양식이니 근거로 쓰지 않는다.
+- `parentSpecPath` (spec·implement) — 계층형 명세에서 상위 명세의 경로.
 
 ## 무엇이 강제되고 무엇이 강제되지 않는가
 

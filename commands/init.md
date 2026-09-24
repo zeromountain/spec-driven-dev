@@ -1,5 +1,5 @@
 ---
-description: 현재 프로젝트에 SDD 하네스를 스캐폴딩한다 (specs/·AGENTS.md·.sdd/ 생성)
+description: 현재 프로젝트에 SDD 하네스를 스캐폴딩한다 (specs/·docs/sdd/·AGENTS.md·.sdd/ 생성)
 argument-hint: (인자 없음 — --enforce·--worktrees 는 대화로 물어본다)
 ---
 

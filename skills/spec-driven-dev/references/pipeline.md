@@ -89,9 +89,21 @@
 | `specChangeRequests` | 구현자 | spec 호출 — 새 버전에 반영할 항목 |
 | `userAnswers` | 사용자 | spec 호출 — 미결 질문의 답 |
 | `testFailures` | 구현 결과 | 다음 implement 호출 — "가설을 바꿔서" 재시도하도록 |
+| `verifyFailures` | 구현 결과 × 계획의 `tasks[].verify` | 다음 implement 호출(`previousVerifyFailures`) — exit code ≠ 0 이거나 보고되지 않은 검증 커맨드 |
+| `verifyResults` | 구현자 | 리뷰 리포트의 `검증 커맨드` 표 |
 | `reviewGaps` | 리뷰어 | implement 호출 — 리뷰 지적이 구현으로 직접 넘어가는 경로 |
 | `implementNotes` / `testResult` | 구현자 | review 호출 — 무엇을 어떻게 했는지 |
 | `lastReviewPath` | 리뷰 리포트 골격 | implement 호출 — 리포트 전문을 읽을 수 있게 |
+
+`carry`가 아니라 매번 디스크에서 다시 읽어 싣는 것도 있다: `contextDocs`(모든 단계 —
+`config.contextDocs`의 PRD·아키텍처·ADR 경로)와 `parentSpecPath`(spec·implement —
+명세 프론트매터 `parent`가 가리키는 상위 명세). 사람이 문서를 고치면 다음 `next`부터
+바로 반영된다.
+
+검증 커맨드 실패는 테스트 실패와 **같은 재시도 예산**(`attempts.implement`)을 쓰지만
+**다른 칸**에 담긴다. 테스트는 통과하고 검증만 실패했을 때 `testFailures`에 통과한 결과를
+실으면 재시도한 구현자가 실패를 보지 못하기 때문이다. 계획에 있는데 보고되지 않은 커맨드도
+실패로 센다 — "안 돌렸다"와 "돌려서 통과했다"를 구분하기 위해서다.
 
 ## 페이즈 게이트와의 관계
 

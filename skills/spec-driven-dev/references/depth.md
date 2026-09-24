@@ -21,7 +21,7 @@ sdd.py depth [<슬러그>] --feature "<기능 설명>" [--force deep|light] --pa
 |---|---|---|
 | `acCount` | 8 이상 | AC가 많으면 한 에이전트의 컨텍스트 안에서 전부 추적되지 않는다 |
 | `ecCount` | 5 이상 | 오류 경로가 많다 = 상태 공간이 넓다 |
-| `warningCount` | 3 이상 | `validate` 경고가 쌓였다 = 명세 문장이 흐리다 |
+| `warningCount` | 3 이상 | `validate` 경고가 쌓였다 = 명세 문장이 흐리다. `code`가 `recommended-section-missing`·`spec-too-large`인 경고는 세지 않는다(`DEPTH_EXEMPT_WARNING_CODES`) — 형식·크기 경고이지 모호함이 아니다 |
 
 ## 신호 키워드
 

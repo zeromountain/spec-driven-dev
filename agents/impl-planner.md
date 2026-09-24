@@ -22,6 +22,10 @@ tools: Read, Grep, Glob, Edit, Bash
    (에러 처리 방식, 검증 위치, 네이밍, 테스트 파일 배치). 근거 경로를 남긴다.
 4. 테스트 러너와 테스트 명령을 실제로 확인한다 (`package.json`, `pyproject.toml`,
    `Makefile` 등을 읽는다 — 추측하지 않는다).
+   태스크마다 **실행 가능한 검증 커맨드**(`verify`)를 하나 정한다 — exit code 0이면 그
+   태스크의 AC가 충족됐다고 확인되는 커맨드(예: `pytest tests/test_auth.py -k AC_1`).
+   구현자가 이 커맨드를 전부 실행해 보고하고, 실패하거나 보고가 빠지면 파이프라인이
+   구현을 다시 돌린다. 실제로 존재하는 러너로만 적는다.
 5. **작업 순서**를 정한다. 의존하는 항목이 먼저 오게 하고, 이유를 한 줄로 적는다.
 6. `specs/<slug>/tasks.md`를 연다 — 오케스트레이터가 `${scriptPath} tasks <슬러그>`로
    AC 대응표를 미리 채워 만들어 뒀다. 남은 `{{...}}` 플레이스홀더를 위 결과로 전부 채운다.
@@ -43,7 +47,7 @@ tools: Read, Grep, Glob, Edit, Bash
   "tasksPath": "specs/<slug>/tasks.md",
   "tasks": [
     {"id": "T-1", "acs": ["AC-1"], "action": "...", "files": ["src/..."],
-     "isNew": false, "dependsOn": []}
+     "isNew": false, "dependsOn": [], "verify": "pytest tests/test_x.py -k AC_1"}
   ],
   "patternsToFollow": [{"pattern": "...", "evidence": "src/...:12"}],
   "testRunner": {"command": "...", "evidence": "package.json:8"},
@@ -66,6 +70,10 @@ tools: Read, Grep, Glob, Edit, Bash
 
 오케스트레이터가 "명세 경로 + `sdd.py tasks` 결과(tasks.md 경로·AC 목록) + 프로젝트 루트"를
 프롬프트로 준다.
+
+`context.contextDocs`의 아키텍처·ADR 문서를 먼저 읽고 거기 적힌 패턴·결정을
+`patternsToFollow`의 근거로 삼는다(`unfilled: true`는 빈 양식이니 제외).
+`parentSpecPath`가 있으면 상위 명세의 인터페이스와 어긋나지 않게 계획한다.
 
 ## 출력 방식
 

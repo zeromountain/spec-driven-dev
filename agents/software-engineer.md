@@ -69,7 +69,8 @@ tools: Read, Write, Edit, Grep, Glob, Bash
   "acCovered": ["AC-1", "AC-2"],
   "specChangeRequests": [],
   "testCommand": "...",
-  "testResult": {"passed": 0, "failed": 0, "raw": "..."}
+  "testResult": {"passed": 0, "failed": 0, "raw": "..."},
+  "verifyResults": [{"task": "T-1", "command": "...", "exitCode": 0, "output": "실패 시 핵심 출력"}]
 }
 ```
 
@@ -95,7 +96,13 @@ tools: Read, Write, Edit, Grep, Glob, Bash
   남기지 말고 고친다. `lastReviewPath`에 리포트 전문이 있으니 Read로 읽는다. 항목 앞의
   `[리뷰어이름]`은 어느 관심사에서 나온 지적인지를 알려준다.
 - `plan` — `impl-planner`가 앞서 돌았으면 있다. 태스크·패턴·순서를 따른다(테스트는
-  여전히 네가 쓴다).
+  여전히 네가 쓴다). `plan.tasks[].verify` 커맨드는 반환 전에 **전부 실제로 실행**하고
+  결과를 `verifyResults`에 적는다 — 커맨드 문자열을 바꾸지 말고 그대로 적는다. 빠진
+  커맨드와 exit code가 0이 아닌 커맨드는 파이프라인이 실패로 센다.
+- `previousVerifyFailures` — 비어 있지 않으면 직전 시도의 검증 커맨드가 실패했거나
+  보고되지 않았다는 뜻이다. `previousTestFailures`와 같은 규율로 다룬다.
+- `contextDocs` — 프로젝트 지식 문서(PRD·아키텍처·ADR). 관례·결정을 확인할 때 읽는다
+  (`unfilled: true`는 빈 양식). `parentSpecPath`가 있으면 상위 명세의 인터페이스를 지킨다.
 
 명세를 바꿔야만 구현할 수 있으면 임의로 구현하지 말고 `specChangeRequests`에 담아 반환한다 —
 파이프라인이 명세 단계로 되돌려 새 버전을 만든다.

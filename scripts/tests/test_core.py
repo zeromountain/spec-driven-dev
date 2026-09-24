@@ -1849,5 +1849,183 @@ class ArchiveTests(unittest.TestCase):
                              / "spec-v1.md").exists())
 
 
+FULL_SPEC = VALID_SPEC.replace("## 기능 요구사항", """## 입력과 출력
+
+- 입력: 문자열 하나
+- 출력: 정수 하나
+
+## 기능 요구사항""").replace("## 인수 기준", """## 인터페이스
+
+- `count(text: str) -> int`
+
+## 인수 기준""")
+
+
+class SpecQualityTests(unittest.TestCase):
+    """권장 섹션·크기 경고는 검증을 막지 않고, 깊이 판정도 올리지 않는다."""
+
+    def test_missing_recommended_sections_warn_but_stay_valid(self):
+        r = sdd.validate_spec(VALID_SPEC)
+        self.assertTrue(r["valid"])
+        codes = [w.get("code") for w in r["warnings"]]
+        self.assertEqual(codes.count("recommended-section-missing"), 2)
+
+    def test_full_spec_has_no_recommended_warning(self):
+        r = sdd.validate_spec(FULL_SPEC)
+        self.assertTrue(r["valid"])
+        self.assertFalse([w for w in r["warnings"] if w.get("code")])
+
+    def test_recommended_warnings_do_not_raise_depth(self):
+        d = sdd.decide_depth(spec_text=VALID_SPEC)
+        self.assertEqual(d["signals"]["warningCount"], 0)
+        self.assertEqual(d["depth"], "light")
+
+    def test_large_spec_suggests_split_without_counting_for_depth(self):
+        acs = "\n".join(f"- [ ] **AC-{i}**: 조건 {i}이면 {i}를 반환해야 한다." for i in range(1, 16))
+        text = FULL_SPEC.split("## 인수 기준")[0] + "## 인수 기준\n\n" + acs + \
+            "\n\n## 오류 케이스" + FULL_SPEC.split("## 오류 케이스")[1]
+        r = sdd.validate_spec(text)
+        self.assertTrue(r["valid"])
+        self.assertIn("spec-too-large", [w.get("code") for w in r["warnings"]])
+        self.assertEqual(sdd.decide_depth(spec_text=text)["signals"]["warningCount"], 0)
+
+    def test_new_spec_template_contains_recommended_sections(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(tmp)
+            created = sdd.create_spec_file(root, "새 기능")
+            sections = sdd.parse_sections((root / created["path"]).read_text(encoding="utf-8"))
+            for name in sdd.RECOMMENDED_SECTIONS:
+                self.assertIn(name, sections)
+
+
+class ParentSpecTests(unittest.TestCase):
+    def _with_parent(self, parent):
+        return FULL_SPEC.replace("status: draft", f"status: draft\nparent: {parent}")
+
+    def test_missing_parent_warns(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _project_with_spec(tmp, "테스트-기능")
+            path = root / "specs" / "테스트-기능" / "spec-v1.md"
+            r = sdd.validate_spec(self._with_parent("없는-기능"), path=path)
+            self.assertTrue(r["valid"])
+            self.assertIn("parent-missing", [w.get("code") for w in r["warnings"]])
+
+    def test_archived_parent_is_found_and_exposed_in_context(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(tmp)
+            parent_dir = root / "specs" / "archive" / "마스터"
+            parent_dir.mkdir(parents=True)
+            (parent_dir / "spec-v1.md").write_text(
+                FULL_SPEC.replace("feature: 테스트-기능", "feature: 마스터"), encoding="utf-8")
+            child = root / "specs" / "테스트-기능"
+            child.mkdir(parents=True)
+            (child / "spec-v1.md").write_text(self._with_parent("마스터"), encoding="utf-8")
+
+            r = sdd.validate_spec((child / "spec-v1.md").read_text(encoding="utf-8"),
+                                  path=child / "spec-v1.md")
+            self.assertNotIn("parent-missing", [w.get("code") for w in r["warnings"]])
+            self.assertEqual(sdd.parent_spec_path(root, "specs/테스트-기능/spec-v1.md"),
+                             "specs/archive/마스터/spec-v1.md")
+            # find_latest_version 은 여전히 아카이브를 보지 않는다
+            self.assertEqual(sdd.find_latest_version(root / "specs", "마스터"), 0)
+
+
+class ContextDocsTests(unittest.TestCase):
+    def test_init_scaffolds_docs_without_overwriting(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            prd = root / "docs" / "sdd" / "prd.md"
+            prd.parent.mkdir(parents=True)
+            prd.write_text("# 우리 PRD\n", encoding="utf-8")
+            _init_project(tmp)
+            self.assertEqual(prd.read_text(encoding="utf-8"), "# 우리 PRD\n")
+            self.assertTrue((root / "docs/sdd/architecture.md").exists())
+            self.assertTrue((root / "docs/sdd/adr/_template.md").exists())
+
+    def test_context_docs_lists_existing_marks_unfilled_and_skips_templates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(tmp)
+            (root / "docs/sdd/prd.md").write_text("# PRD\n채워짐\n", encoding="utf-8")
+            (root / "docs/sdd/adr/0001-db.md").write_text("# ADR-0001\n", encoding="utf-8")
+            docs = {d["path"]: d["unfilled"] for d in sdd.context_docs(root)}
+            self.assertEqual(docs, {"docs/sdd/prd.md": False,
+                                    "docs/sdd/architecture.md": True,
+                                    "docs/sdd/adr/0001-db.md": False})
+
+    def test_every_stage_context_carries_context_docs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(tmp)
+            first = _run(root, "테스트 기능")["next"]
+            self.assertIn("contextDocs", first["context"])
+            _write_valid_spec(root, first["context"]["specPath"])
+            impl = _advance(root, {"openQuestions": []})["next"]
+            self.assertTrue(impl["context"]["contextDocs"])
+            review = _advance(root, {"testResult": {"passed": 1, "failed": 0}})["next"]
+            self.assertTrue(review["agents"][0]["context"]["contextDocs"])
+            # agents/*.md 는 Codex 에 없다 — 안내가 instruction 에도 실려야 한다
+            for payload in (first, impl, review):
+                self.assertIn("contextDocs", payload["instruction"])
+
+
+class VerifyCommandTests(unittest.TestCase):
+    """impl-planner 의 verify 커맨드는 실행 결과로 구현 재시도를 가른다."""
+
+    PLAN = {"tasks": [{"id": "T-1", "acs": ["AC-1"], "verify": "pytest -k AC_1"},
+                      {"id": "T-2", "acs": ["AC-2"], "verify": "pytest -k AC_2"}]}
+
+    def _to_engineer(self, root):
+        _run(root, "테스트 기능", depth="deep")
+        _write_valid_spec(root, _next(root)["context"]["specPath"])
+        _advance(root, {"openQuestions": []})
+        return _advance(root, self.PLAN)["next"]
+
+    def test_engineer_is_told_to_run_verifies(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            nxt = self._to_engineer(_init_project(tmp))
+            self.assertEqual(nxt["agent"], "software-engineer")
+            self.assertIn("verifyResults", nxt["instruction"])
+
+    def test_failed_verify_retries_with_separate_carry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(tmp)
+            self._to_engineer(root)
+            after = _advance(root, {"testResult": {"passed": 2, "failed": 0},
+                                    "verifyResults": [
+                                        {"task": "T-1", "command": "pytest -k AC_1", "exitCode": 0},
+                                        {"task": "T-2", "command": "pytest -k AC_2", "exitCode": 1}]})
+            nxt = after["next"]
+            self.assertEqual(nxt["stage"], "implement")
+            self.assertIsNone(nxt["context"]["previousTestFailures"])
+            fails = nxt["context"]["previousVerifyFailures"]
+            self.assertEqual([f["command"] for f in fails], ["pytest -k AC_2"])
+
+    def test_unreported_verify_counts_as_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(tmp)
+            self._to_engineer(root)
+            after = _advance(root, {"testResult": {"passed": 2, "failed": 0}})
+            fails = after["next"]["context"]["previousVerifyFailures"]
+            self.assertEqual(len(fails), 2)
+            self.assertTrue(all(f["exitCode"] is None for f in fails))
+
+    def test_string_exit_code_zero_is_success(self):
+        self.assertEqual(sdd._failed_verifies(
+            [{"task": "T-1", "command": "make check"}],
+            [{"task": "T-1", "command": "make check", "exitCode": "0"}]), [])
+
+    def test_passing_verifies_reach_review_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(tmp)
+            self._to_engineer(root)
+            after = _advance(root, {"testResult": {"passed": 2, "failed": 0},
+                                    "verifyResults": [
+                                        {"task": "T-1", "command": "pytest -k AC_1", "exitCode": 0},
+                                        {"task": "T-2", "command": "pytest -k AC_2", "exitCode": 0}]})
+            self.assertEqual(after["next"]["stage"], "review")
+            report = (root / after["next"]["agents"][0]["context"]["reviewPath"]).read_text(encoding="utf-8")
+            self.assertIn("`pytest -k AC_2`", report)
+            self.assertNotIn("{{verifyRows}}", report)
+
+
 if __name__ == "__main__":
     unittest.main()

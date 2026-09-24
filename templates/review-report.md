@@ -22,6 +22,10 @@
 
 {{ecRows}}
 
+## 검증 커맨드
+
+{{verifyRows}}
+
 ## 코드 품질
 
 {{codeReviewSection}}

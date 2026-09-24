@@ -130,7 +130,9 @@ Codex에는 슬래시 커맨드가 없으므로 **의도를 말로 전한다.** 
 `.sdd/state.json`에 남으므로 세션이 끊겨도 "아까 하던 거 이어서"로 같은 자리에서 이어진다.
 
 `init`은 다음을 만든다: `specs/`, `.sdd/state.json`(세션 로컬, gitignore됨),
-`.sdd/config.json`(팀 공유, 커밋됨), `.sdd/reviews/`, 그리고 프로젝트의 `AGENTS.md`(없으면
+`.sdd/config.json`(팀 공유, 커밋됨), `.sdd/reviews/`, 프로젝트 지식 양식 `docs/sdd/prd.md`·
+`docs/sdd/architecture.md`·`docs/sdd/adr/_template.md`(없을 때만 — 채워 두면 모든 에이전트가
+명세보다 먼저 읽는다), 그리고 프로젝트의 `AGENTS.md`(없으면
 생성, 있으면 "## Spec-Driven Development" 섹션만 추가/교체). 이미 있는 내용은 절대
 덮어쓰지 않는다.
 

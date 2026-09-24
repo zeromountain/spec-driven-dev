@@ -46,7 +46,7 @@ spec-driven-dev/
 ├── agents/                  # 6 role-bound subagents (see above) — Claude Code only
 ├── hooks/                   # phase_gate.py + hooks.json (opt-in per project) — Claude Code only
 ├── scripts/                 # sdd.py (stdlib-only CLI) + tests/ (both hosts)
-├── templates/                # scaffolded artifacts (spec.md, tasks.md, review-report.md, AGENTS.sdd.md)
+├── templates/                # scaffolded artifacts (spec.md, tasks.md, review-report.md, AGENTS.sdd.md, prd.md, architecture.md, adr.md)
 └── docs/SETUP.md            # install/verify/troubleshoot guide for both hosts
 ```
 
@@ -136,6 +136,24 @@ Keep the two manifests' `version` fields in lockstep — `scripts/validate.py` e
   entirely. The tick helper converts existing boxes only: adding one to an EC bullet makes
   `EC_LINE_RE` stop recognizing it, which fails validation and halts the next
   `implement` transition.
+- **Project knowledge reaches agents as paths, not bodies.** `config.contextDocs`
+  (default `docs/sdd/prd.md`, `docs/sdd/architecture.md`, `docs/sdd/adr/`) is resolved
+  by `context_docs()` on every `next` and put in every stage's `context` as
+  `[{path, unfilled}]`. Don't inline document bodies there — `next` output would grow
+  with the docs. `init` scaffolds these files only when absent; `_`-prefixed files in a
+  directory entry are templates and are skipped.
+- **Recommended spec sections warn, they don't fail.** `입력과 출력` and `인터페이스`
+  (`RECOMMENDED_SECTIONS`) and the `spec-too-large` split hint emit warnings with a
+  `code`. Any warning code in `DEPTH_EXEMPT_WARNING_CODES` is excluded from
+  `decide_depth()`'s `warningCount` — otherwise every pre-0.15 spec turns deep for
+  lacking a section. Keep section names free of `·`: headers are matched exactly.
+  A spec's optional `parent` is resolved by `locate_spec()` (main tree, then archive);
+  that is the one sanctioned archive lookup — `find_latest_version` stays archive-blind.
+- **Verify commands fail closed.** `impl-planner`'s `tasks[].verify` becomes
+  `planned_verifies()`; `_failed_verifies()` counts non-zero exit codes *and* planned
+  commands the engineer didn't report. Failures share the `attempts.implement` budget
+  with test failures but live in `carry.verifyFailures`, never in `testFailures` — a
+  passing `testResult` in `testFailures` hides the failure from the retrying engineer.
 - **The gate enforces phase boundaries, not intra-phase role separation.** PreToolUse
   payloads carry no subagent identity, so `software-engineer` writing to `tests/` in deep
   mode is not blocked. Read-only roles are enforced by having no write tool in their
