@@ -38,6 +38,10 @@ PreToolUse 훅이 페이즈 경계를 실제로 막는다. 진행 위치와 **�
 7. **하드 게이트를 대신 끄지 않는다.** 페이즈 게이트가 deny하면, 그 파일을 다른 경로로
    우회해 쓰지 않는다. 파이프라인 안에서는 `next`가 정식 전환을 이미 하며, 전환이 막히면
    `halted`로 그 이유를 그대로 보고한다. 게이트를 끄는 것은 사용자의 `/sdd:phase off`뿐이다.
+8. **사람이 판단할 자리는 사람에게 둔다.** 명세(기본)와 구현 계획(설정 시)은 사람이
+   승인해야 다음 단계로 간다 — `next`가 `approve`를 낸다. 네가 대신 `{"approve": true}`를
+   넘기지 않는다. 사용자가 "확인 없이 끝까지 돌려"라고 **명시적으로** 말했을 때만
+   `run --no-gate`로 그 run의 승인 지점을 건너뛴다.
 
 ## 서브에이전트 6종
 
@@ -79,6 +83,7 @@ Codex에서의 진입점이다.
 | init | `/sdd:init` | "SDD 설정해줘" | `sdd.py init` → 스캐폴딩, AGENTS.md 병합, 게이트·워크트리 여부 확인 |
 | run | `/sdd:run <설명> [--deep\|--light]` | "<기능> 명세부터 만들어서 끝까지" | 파이프라인 시작 → **next/advance 루프**를 끝까지 돌린다 |
 | resume | `/sdd:run` (인자 없이) | "아까 하던 거 이어서" | 중단된 파이프라인을 그 자리에서 재개 |
+| run (확인 없이) | `/sdd:run <설명> --no-gate` | "<기능> 확인 없이 끝까지 돌려" | 이 run의 사람 승인 지점(`approve`)을 건너뛴다 — 사용자가 명시적으로 말했을 때만 |
 | reopen | `/sdd:run --spec <슬러그> --from review` | "<기능> 리뷰만 다시 돌려줘" | 끝난 파이프라인의 그 단계를 다시 연다 |
 | run-all | `/sdd:run --all` | "지금 걸린 거 전부 같이 돌려줘" | 살아 있는 파이프라인 **전부**를 배치 루프로 |
 | board | `/sdd:board` | "지금 뭐뭐 돌고 있어" | 살아 있는 파이프라인 전부의 위치·실행 가능 여부 |
@@ -161,13 +166,14 @@ init부터 안내한다.
 $S/sdd.py run "<기능 설명>" --path <root>
 ```
 
-응답의 `next.action`에 따라 아래를 **`done`·`halted`·`ask-user`가 나올 때까지 반복한다**:
+응답의 `next.action`에 따라 아래를 **`done`·`halted`·`ask-user`·`approve`가 나올 때까지 반복한다**:
 
 | `action` | 할 일 |
 |---|---|
 | `call-agent` | `agent`가 지정한 서브에이전트를 `instruction` + `context`를 **그대로** 전달해 호출한다. 반환된 JSON을 그대로 `$S/sdd.py advance --path <root> --stage <stage> --result '<json>'`에 넘긴다. 그 응답의 `next`가 다음 라운드다. |
 | `call-agents` | 리뷰 단계. `agents[]`의 리뷰어를 **한 메시지에서 동시에** 호출한다 — 순차로 부르며 앞선 판정을 다음 리뷰어에게 알려주면 독립성이 깨진다. 각 결과에 **`agent` 키를 붙여** `advance --result '{"reviews": [...]}'`로 넘긴다(하나씩 따로 넘겨도 누적된다). `alreadyReported`에 있는 리뷰어는 다시 부르지 않는다. 종합 판정은 로스터 전원이 모였을 때 `advance`가 낸다. |
 | `ask-user` | `questions`를 사용자에게 그대로 묻는다. 답을 `advance --result '{"answers": {...}}'`로 넘기면 루프가 이어진다. |
+| `approve` | 사람 승인 지점(`gate`: `spec` 또는 `plan`). `path` 파일을 열어보라고 안내하고, `summary`(인수 기준·오류 케이스·범위 밖·가정·경고, 또는 태스크·파일·검증 커맨드)를 **그대로** 보여준 뒤 승인 여부를 묻는다. 승인이면 `advance --result '{"approve": true}'`, 고칠 점이 있으면 사용자의 말을 그대로 `advance --result '{"feedback": ["..."]}'`로 넘긴다 — 같은 역할이 다시 불려 반영하고, 다시 `approve`로 온다. |
 | `done` | 완료. 5단계(기록)로 간다. |
 | `halted` | `reason`과 `history`를 그대로 사용자에게 보고하고 멈춘다. 지어내서 우회하지 않는다. |
 | `init-required` / `none` | 각각 `/sdd:init`, `/sdd:run <설명>`을 안내한다. |
@@ -180,7 +186,8 @@ $S/sdd.py run "<기능 설명>" --path <root>
   `review-report`를 손으로 부르면 상태가 어긋난다. 완료된 명세를 손으로 체크하거나
   `specs/archive/`로 옮기지도 마라 — 되열 때 자동으로 되돌아온다.
 - `advance`를 건너뛰고 다음 서브에이전트를 부르지 마라 — 그 순간 파이프라인이 제자리에 남는다.
-- 단계 사이에서 사용자에게 "계속할까요?"를 묻지 마라. 멈추는 건 `ask-user`와 `halted`뿐이다.
+- 단계 사이에서 사용자에게 "계속할까요?"를 묻지 마라. 멈추는 건 `ask-user`·`approve`·`halted`뿐이다.
+- `approve`를 네 판단으로 통과시키지 마라. 요약이 괜찮아 보여도 사용자의 답을 받는다.
 - 재시도 횟수를 세지 마라. `attempts`/`maxAttempts`는 `advance`가 센다.
 - `waiting`에 있는 파이프라인을 억지로 돌리지 마라. 스케줄러가 페이즈 충돌이나 파일 겹침을
   이미 확인했다 — 우회하면 한쪽 작업이 사라지거나 게이트에 막힌다.
@@ -211,7 +218,9 @@ $S/sdd.py run --all --path <root>                # 전부를 대상으로 배치
 
 이후 라운드는 `$S/sdd.py next --all`로 연다. `action: "batch"`를 내면 **`round[]`의 행동들을 한 메시지에서 동시에
 호출한다.** 스케줄러가 이미 안전을 확인한 목록이므로 네가 다시 판단하지 않는다. 각 결과는
-`advance --spec <슬러그>`로 **따로** 넘긴다.
+`advance --spec <슬러그>`로 **따로** 넘긴다. `round[]`에 `approve`·`ask-user`가 섞여 있으면
+서브에이전트 호출은 그대로 진행하고, 사람에게 물을 것들은 **한 번에 모아** 묻는다 — 승인
+대기 중인 파이프라인은 다른 파이프라인을 막지 않는다.
 
 ```bash
 $S/sdd.py advance --spec 프로필-이미지-업로드 --result '<json>' --path <root>

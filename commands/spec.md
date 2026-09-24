@@ -11,4 +11,5 @@ argument-hint: <기능 설명>, 예: 사용자 엔티티에 결혼여부 필드 
 `next`가 `call-agent`를 지시하면 그 컨텍스트로 `spec-architect`를 호출하고, 반환된 JSON을
 `sdd.py advance`에 넘긴 뒤 **다음 `next`를 사용자에게 보여주고 멈춘다**(이어서 구현까지
 가려면 `/sdd:run`). `next.stage`가 `spec`이 아니면 그 사실을 알리고 파이프라인의 단계를
-따른다. `ask-user`가 나오면 질문을 그대로 사용자에게 전달한다.
+따른다. `ask-user`가 나오면 질문을, `approve`가 나오면 요약과 명세 경로를 그대로 사용자에게
+전달한다(대신 승인하지 않는다).

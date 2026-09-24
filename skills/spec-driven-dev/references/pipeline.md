@@ -16,7 +16,7 @@
     "feature": "사용자 엔티티에 결혼여부 필드 추가",
     "slug": "user-marital-status",
     "stage": "implement",            // spec | implement | review | done
-    "status": "running",             // running | awaiting-user | halted | done
+    "status": "running",             // running | awaiting-user(질문·승인 대기) | halted | done
     "attempts": {"spec": 0, "specRevision": 0, "implement": 1, "review": 1},
     "maxAttempts": 2,
     "steps": 5,                      // 전체 전이 횟수 (MAX_PIPELINE_STEPS=24에서 중단)
@@ -50,6 +50,7 @@
 |---|---|---|
 | `call-agent` | 서브에이전트 한 번 호출 | `agent`·`instruction`·`context`를 그대로 전달, 결과를 `advance`에 |
 | `ask-user` | 명세 단계에서 미결 질문 발생 | `questions`를 묻고 `{"answers": {...}}`로 `advance` |
+| `approve` | 사람 승인 지점 (`gate: spec` 또는 `plan`) | `path`·`summary`를 보여주고 `{"approve": true}` 또는 `{"feedback": [...]}`로 `advance`. **대신 승인하지 않는다** |
 | `done` | 리뷰 승인으로 완료 | 결과 요약 보고 |
 | `halted` | 재시도 상한·수렴 실패·판정 불가 | `reason`을 그대로 보고하고 멈춤 |
 | `none` | 파이프라인 없음 | `run "<설명>"` 안내 |
@@ -63,13 +64,39 @@
 |---|---|---|
 | spec | `openQuestions` 있음 | `status: awaiting-user` — 사용자 답을 받으면 같은 단계 재개 |
 | spec | `validate` 실패 | `attempts.spec++`, 같은 파일을 고치도록 spec 재호출. 상한 초과 시 halted |
-| spec | `validate` 통과 | → implement |
+| spec | `validate` 통과, `humanGates.spec` 켜짐, 이 버전 미승인 | `status: awaiting-user` + `carry.pendingApproval` → `approve` |
+| spec | `validate` 통과 (승인 지점 없음 또는 이미 승인) | → implement |
+| (승인 대기) | `{"approve": true}` | spec이면 `approvedSpecVersion` 기록 후 → implement, plan이면 → software-engineer |
+| (승인 대기) | `{"feedback": [...]}` | 같은 역할 재호출 (`userFeedback` 인계). 명세는 **같은 버전**을 고친다. 재시도 예산을 쓰지 않는다 |
+| (승인 대기) | 둘 다 아님 | `ok: false`, 상태 변화 없음 |
+| implement (planner) | 계획 반환, `humanGates.plan` 켜짐 | → `approve` (`gate: plan`) |
 | implement | `specChangeRequests` 있음 | `attempts.specRevision++`, **새 버전 명세**(v+1)를 만들며 → spec |
 | implement | `testResult.failed > 0` | `attempts.implement++`, 실패 내용을 넘겨 재호출. 상한 초과 시 halted |
 | implement | 테스트 통과 (또는 보고 없음) | → review |
 | review | `verdict: approved` | 명세·`tasks.md`의 남은 `- [ ]` 를 전부 채우고, `status: done` 기록, 디렉터리째 `specs/archive/<슬러그>/` 로 이동, `activeSpec` 해제, `phase: off`, `status: done` |
 | review | `verdict: changes-requested` | `attempts.review++`, `gaps`를 넘겨 → implement. 상한 초과 시 halted |
 | review | verdict 판독 불가 | halted |
+
+### 사람 승인 지점 (`humanGates`)
+
+`.sdd/config.json`의 `humanGates`(기본 `{"spec": true, "plan": false}`)가 켜진 지점에서
+파이프라인은 사람의 판단을 기다린다. 명세는 설계의 결과라 AI가 쓰더라도 사람이 판단해야
+하고, 계획 승인은 원하는 프로젝트만 켠다. 일부 키만 적어도 나머지는 기본값을 따른다.
+
+- 승인은 **명세 버전 단위**다. 명세 변경 요청으로 새 버전이 생기거나 `run --from spec`으로
+  다시 열면 다시 멈춘다. `--from implement`/`review`는 승인을 유지하고, `--restart`는
+  파이프라인을 새로 만들므로 승인 기록도 없다.
+- `enforce: true`에서도 승인 대기는 페이즈를 붙잡지 않는다. 대기 중인 파이프라인은
+  `running`이 아니라서 스케줄러가 페이즈를 고를 때 세지 않고, 다른 파이프라인의 단계로
+  페이즈가 넘어간다. 승인되거나 피드백으로 다시 `running`이 되면 그때 스케줄러의 판단을
+  받는다.
+- `summary`는 모델의 요약이 아니라 `sdd.py`가 명세·계획에서 직접 뽑은 것이다 — 명세면
+  인수 기준·오류 케이스·범위 밖·아키텍트의 `assumptions`·검증 경고, 계획이면 태스크·
+  `verify`·순서·손댈 파일.
+- 승인 대기(`awaiting-user`)는 스케줄러에서 `runnable`이 아니다. `next --all`은 이것을
+  `round[]`에 `approve`로 싣고, 다른 파이프라인은 그대로 진행된다.
+- `run --no-gate`는 그 파이프라인(`--all`이면 살아 있는 전부)에 `gatesOff`를 걸고, 이미
+  대기 중인 승인이 있으면 사용자의 명시적 지시로 보고 풀어 준다(`approved-by-no-gate` 기록).
 
 `maxAttempts`는 기본 2이고 `run --max-attempts N`으로 바꾼다. 그 위에 전체 전이 횟수
 상한(`MAX_PIPELINE_STEPS = 24`)이 따로 있어, 어떤 조합으로도 무한 루프가 되지 않는다.
@@ -88,6 +115,9 @@
 | `validateErrors` | spec 검증 실패 | 다음 spec 호출 — 무엇이 틀렸는지 |
 | `specChangeRequests` | 구현자 | spec 호출 — 새 버전에 반영할 항목 |
 | `userAnswers` | 사용자 | spec 호출 — 미결 질문의 답 |
+| `userFeedback` | 사용자 (승인 지점의 `feedback`) | spec 또는 impl-planner 재호출 — 반영할 지적 |
+| `assumptions` | spec-architect | 명세 승인 `summary` — 사람이 검토할 가정 |
+| `pendingApproval` / `approvedSpecVersion` | 승인 지점 | `next`의 `approve` / 같은 버전 재승인 방지 |
 | `testFailures` | 구현 결과 | 다음 implement 호출 — "가설을 바꿔서" 재시도하도록 |
 | `verifyFailures` | 구현 결과 × 계획의 `tasks[].verify` | 다음 implement 호출(`previousVerifyFailures`) — exit code ≠ 0 이거나 보고되지 않은 검증 커맨드 |
 | `verifyResults` | 구현자 | 리뷰 리포트의 `검증 커맨드` 표 |
