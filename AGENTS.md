@@ -149,6 +149,16 @@ Keep the two manifests' `version` fields in lockstep — `scripts/validate.py` e
   lacking a section. Keep section names free of `·`: headers are matched exactly.
   A spec's optional `parent` is resolved by `locate_spec()` (main tree, then archive);
   that is the one sanctioned archive lookup — `find_latest_version` stays archive-blind.
+- **Human gates stop the state machine; the model never approves.** `humanGates`
+  (default `{spec: true, plan: false}`, merged key-by-key by `human_gate_on()`) parks a
+  pipeline in `awaiting-user` with `carry.pendingApproval`; `compute_next` turns that into
+  `action: "approve"` (distinct from `ask-user`) with a summary extracted by
+  `spec_approval_summary`/`plan_approval_summary`, not written by an LLM. `advance`
+  accepts only `{"approve": true}` or `{"feedback": [...]}` (`resolve_approval()`), and
+  rejects anything else without mutating state. Spec approval is per `specVersion`
+  (`approvedSpecVersion`), so a new version or `--from spec` asks again. Feedback reruns
+  the same role on the same file and does not spend `attempts`. `run --no-gate` is the
+  only bypass and must come from the user; it also releases an approval already pending.
 - **Verify commands fail closed.** `impl-planner`'s `tasks[].verify` becomes
   `planned_verifies()`; `_failed_verifies()` counts non-zero exit codes *and* planned
   commands the engineer didn't report. Failures share the `attempts.implement` budget

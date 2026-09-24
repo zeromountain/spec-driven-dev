@@ -68,6 +68,9 @@ DEFAULT_CONFIG = {
     # 명세보다 위에 있는 프로젝트 지식(PRD·아키텍처·ADR). 경로만 에이전트 컨텍스트에
     # 실리고 본문은 에이전트가 직접 읽는다. 디렉터리면 그 안의 *.md 전부.
     "contextDocs": ["docs/sdd/prd.md", "docs/sdd/architecture.md", "docs/sdd/adr"],
+    # 사람이 승인해야 다음 단계로 넘어가는 지점. 명세는 설계의 결과라 사람이 판단하고,
+    # 계획 승인은 원하는 프로젝트만 켠다. 한 run 에서만 끄려면 `run --no-gate`.
+    "humanGates": {"spec": True, "plan": False},
 }
 
 DEFAULT_STATE = {
@@ -1706,6 +1709,7 @@ def _new_pipeline(feature: str, slug: str, max_attempts: int) -> dict:
         "roster": None,          # 단계 진입 시 refresh_roster 가 채운다
         "depth": None,
         "forcedDepth": None,
+        "gatesOff": False,
         "attempts": {"spec": 0, "specRevision": 0, "implement": 0, "review": 0},
         "maxAttempts": max_attempts,
         "steps": 0,
@@ -1728,6 +1732,10 @@ def _new_pipeline(feature: str, slug: str, max_attempts: int) -> dict:
             "filesChanged": [],
             "reviewVerdicts": [],
             "reviewResults": [],
+            "assumptions": [],
+            "pendingApproval": None,
+            "approvedSpecVersion": None,
+            "userFeedback": [],
         },
         "history": [],
         "haltReason": None,
@@ -2000,6 +2008,107 @@ def _advance_agent(pipe: dict) -> bool:
     return True
 
 
+def human_gate_on(root: Path, pipe: dict, gate: str) -> bool:
+    """이 파이프라인이 `gate` 에서 사람 승인을 기다려야 하는가.
+
+    config 의 humanGates 가 일부 키만 가져도 나머지는 기본값을 따른다 — dict.update 가
+    humanGates 를 통째로 바꾸므로 여기서 다시 합친다."""
+    if pipe.get("gatesOff"):
+        return False
+    stored = read_json(root / ".sdd" / "config.json") or {}
+    gates = dict(DEFAULT_CONFIG["humanGates"])
+    if isinstance(stored.get("humanGates"), dict):
+        gates.update(stored["humanGates"])
+    return bool(gates.get(gate))
+
+
+def _bullets(section_text: str) -> list:
+    return [m.group(1).strip() for m in re.finditer(r"^\s*[-*]\s+(.+)$", section_text or "",
+                                                     re.MULTILINE)]
+
+
+def spec_approval_summary(spec_path: Path, carry: dict) -> dict:
+    """사람이 명세를 판단하는 데 필요한 것만 결정론적으로 뽑는다 — 모델의 요약이 아니다."""
+    text = spec_path.read_text(encoding="utf-8")
+    sections = parse_sections(text)
+    v = validate_spec(text, path=spec_path)
+
+    def items(name, prefix):
+        return [f"{prefix}-{num}: {sentence}"
+                for num, sentence, bad in extract_id_items(sections.get(name, ""), prefix)
+                if not bad]
+
+    return {
+        "acceptanceCriteria": items("인수 기준", "AC"),
+        "errorCases": items("오류 케이스", "EC"),
+        "outOfScope": _bullets(sections.get("범위 밖", "")),
+        "assumptions": carry.get("assumptions") or [],
+        "warnings": [w["message"] for w in v["warnings"]],
+    }
+
+
+def plan_approval_summary(pipe: dict) -> dict:
+    plan = pipe["carry"].get("plan") or {}
+    return {
+        "tasks": [{k: t.get(k) for k in ("id", "acs", "action", "files", "verify")}
+                  for t in plan.get("tasks") or [] if isinstance(t, dict)],
+        "order": plan.get("order") or [],
+        "files": sorted(planned_files(pipe)),
+        "testRunner": plan.get("testRunner"),
+    }
+
+
+def _await_approval(pipe: dict, gate: str, summary: dict) -> None:
+    pipe["carry"]["pendingApproval"] = {
+        "gate": gate,
+        "specPath": pipe.get("specPath"),
+        "specVersion": pipe.get("specVersion"),
+        "tasksPath": pipe.get("tasksPath"),
+        "summary": summary,
+    }
+    pipe["status"] = "awaiting-user"
+    _record(pipe, "awaiting-approval", gate=gate)
+
+
+def resolve_approval(pipe: dict, result: dict, by: str = "user"):
+    """승인 대기 중인 파이프라인에 사람의 판단을 반영한다. 형식이 틀리면 사유 문자열.
+
+    - `{"approve": true}` → 다음 역할/단계로.
+    - `{"feedback": [...]}` → 같은 역할을 다시 부른다. 명세는 **같은 버전**을 고친다 —
+      아직 구현 전이라 버전을 올릴 이유가 없다. 사람 피드백 루프는 재시도 예산을 쓰지
+      않는다(수렴은 사람이 책임진다)."""
+    carry = pipe["carry"]
+    pending = carry.get("pendingApproval") or {}
+    gate = pending.get("gate")
+    feedback = result.get("feedback")
+    if isinstance(feedback, str):
+        feedback = [feedback]
+    feedback = [str(f) for f in (feedback or []) if str(f).strip()]
+
+    if result.get("approve") is True:
+        carry["pendingApproval"] = None
+        carry["userFeedback"] = []
+        pipe["status"] = "running"
+        _record(pipe, "approved-by-" + by, gate=gate)
+        if gate == "spec":
+            carry["approvedSpecVersion"] = pipe.get("specVersion")
+            if not _advance_agent(pipe):
+                _enter_stage(pipe, "implement")
+        elif not _advance_agent(pipe):
+            # 계획자가 로스터의 마지막이면(플러그인 업그레이드로 순서가 바뀐 경우 등)
+            # 같은 자리에 머물지 않게 다음 단계로 넘긴다.
+            _enter_stage(pipe, "review")
+        return None
+    if feedback:
+        carry["pendingApproval"] = None
+        carry["userFeedback"] = feedback
+        pipe["status"] = "running"
+        _record(pipe, "user-feedback", gate=gate, count=len(feedback))
+        return None
+    return ("승인 대기 중이다 — `{\"approve\": true}` 또는 "
+            "`{\"feedback\": [\"...\"]}` 를 넘겨라")
+
+
 TODO_BOX_RE = re.compile(r"^(\s*[-*]\s*)\[ \](\s|$)")
 
 
@@ -2083,6 +2192,8 @@ def pipeline_summary(pipe) -> dict:
         "specPath": pipe.get("specPath"),
         "reviewPath": pipe.get("reviewPath"),
         "haltReason": pipe.get("haltReason"),
+        "pendingApproval": ((pipe.get("carry") or {}).get("pendingApproval") or {}).get("gate"),
+        "gatesOff": bool(pipe.get("gatesOff")),
         "startedAt": pipe.get("startedAt"),
         "updatedAt": pipe.get("updatedAt"),
     }
@@ -2305,6 +2416,20 @@ def compute_next(root: Path, slug=None) -> dict:
                 "history": _tail_history(pipe),
                 "message": "파이프라인이 멈춰 있다 — 사용자에게 사유를 보고하라. "
                            "고치고 나서 `sdd.py run --resume` 으로 같은 자리에서 다시 시작할 수 있다"}
+    pending = pipe["carry"].get("pendingApproval") if status == "awaiting-user" else None
+    if pending:
+        target_path = pending.get("tasksPath") if pending.get("gate") == "plan" \
+            else pending.get("specPath")
+        return {"action": "approve", "gate": pending.get("gate"),
+                "pipeline": pipeline_summary(pipe),
+                "path": target_path, "summary": pending.get("summary"),
+                "message": ("사람의 판단이 필요한 지점이다 — "
+                            + ("명세" if pending.get("gate") == "spec" else "구현 계획")
+                            + "를 사용자에게 보여주고(path 파일을 열어보라고 안내한다) 승인 "
+                              "여부를 묻는다. 네가 대신 승인하지 마라"),
+                "then": "승인이면 `sdd.py advance --spec " + pipe["slug"]
+                        + " --result '{\"approve\": true}'`, 고칠 점이 있으면 "
+                          "`--result '{\"feedback\": [\"...\"]}'`"}
     if status == "awaiting-user":
         return {"action": "ask-user", "pipeline": pipeline_summary(pipe),
                 "questions": pipe["carry"].get("openQuestions", []),
@@ -2418,6 +2543,7 @@ def _next_spec(root: Path, pipe: dict) -> dict:
         "specChangeRequests": carry.get("specChangeRequests") or [],
         "reviewGaps": carry.get("reviewGaps") or [],
         "userAnswers": carry.get("userAnswers") or {},
+        "userFeedback": carry.get("userFeedback") or [],
         "acPattern": config["acPattern"],
         "workdir": str(pipeline_workdir(root, pipe)),
         "existingSpecs": listing["specs"],
@@ -2427,7 +2553,10 @@ def _next_spec(root: Path, pipe: dict) -> dict:
         "contextDocs": context_docs(root, config),
         "parentSpecPath": parent_spec_path(root, pipe["specPath"], config),
     }
-    if context["validateErrors"]:
+    if context["userFeedback"]:
+        instruction = ("사용자가 명세를 검토하고 피드백을 줬다. userFeedback을 하나도 남기지 "
+                       "말고 같은 파일(specPath)에 반영하라 (새 버전을 만들지 마라).")
+    elif context["validateErrors"]:
         instruction = ("직전 명세가 검증에 실패했다. validateErrors를 전부 해소하도록 "
                        "같은 파일을 고쳐라 (새 버전을 만들지 마라).")
     elif context["specChangeRequests"]:
@@ -2485,8 +2614,14 @@ def _next_implement(root: Path, pipe: dict) -> dict:
         "parentSpecPath": parent_spec_path(root, pipe["specPath"], config),
     }
     agent = current_agent(pipe)
-
     if agent == "impl-planner":
+        context["userFeedback"] = carry.get("userFeedback") or []
+
+    if agent == "impl-planner" and context["userFeedback"]:
+        instruction = ("사용자가 직전 계획을 검토하고 피드백을 줬다. plan이 직전 계획이다 — "
+                       "userFeedback을 하나도 남기지 말고 반영해 tasksPath를 다시 채워라. "
+                       "구현 코드는 한 줄도 쓰지 마라.")
+    elif agent == "impl-planner":
         instruction = ("인수 기준을 작업 단위로 쪼개고 영향 파일·따를 패턴·테스트 러너를 "
                        "실제 경로 근거와 함께 확정해 tasksPath의 플레이스홀더를 채워라. "
                        "구현 코드는 한 줄도 쓰지 마라.")
@@ -2613,8 +2748,16 @@ def _advance_spec_architect(root: Path, pipe: dict, result: dict) -> None:
     carry["validateErrors"] = []
     carry["specChangeRequests"] = []
     carry["reviewGaps"] = []
+    carry["userFeedback"] = []
+    carry["assumptions"] = [str(a) for a in (result.get("assumptions") or [])]
     pipe["attempts"]["spec"] = 0
     _record(pipe, "spec-valid", acCount=len(v["acIds"]), ecCount=len(v["ecIds"]))
+    # 이 버전을 사람이 아직 보지 않았으면 구현으로 넘어가지 않는다. 새 버전(명세 변경
+    # 요청)이나 피드백 반영 뒤에는 버전 비교·승인 기록이 달라 다시 멈춘다.
+    if human_gate_on(root, pipe, "spec") \
+            and carry.get("approvedSpecVersion") != pipe.get("specVersion"):
+        _await_approval(pipe, "spec", spec_approval_summary(spec_path, carry))
+        return
     # spec-architect는 spec 로스터의 마지막이다 — 더 부를 역할이 있으면 그쪽으로.
     if _advance_agent(pipe):
         return
@@ -2632,7 +2775,11 @@ def _advance_implement(root: Path, pipe: dict, result: dict) -> None:
             "testRunner": result.get("testRunner"),
             "order": result.get("order") or [],
         }
+        carry["userFeedback"] = []
         _record(pipe, "plan-ready", tasks=len(carry["plan"]["tasks"]))
+        if human_gate_on(root, pipe, "plan"):
+            _await_approval(pipe, "plan", plan_approval_summary(pipe))
+            return
         _advance_agent(pipe)
         return
 
@@ -2928,6 +3075,7 @@ def reopen_pipeline(root: Path, pipe: dict, stage: str, depth=None) -> dict:
     pipe["haltReason"] = None
     pipe["carry"]["reviewResults"] = []
     pipe["carry"]["reviewVerdicts"] = []
+    pipe["carry"]["pendingApproval"] = None
     if stage == "review":
         # 리포트 골격을 새로 만들게 한다 — 낡은 리포트에 새 리뷰어 절이 없다.
         pipe["reviewPath"] = None
@@ -2938,6 +3086,8 @@ def reopen_pipeline(root: Path, pipe: dict, stage: str, depth=None) -> dict:
         pipe["carry"]["verifyFailures"] = None
     else:
         pipe["attempts"]["spec"] = 0
+        # 명세부터 다시 여는 것이면 사람이 다시 본다.
+        pipe["carry"]["approvedSpecVersion"] = None
 
     if depth is not None:
         pipe["forcedDepth"] = depth
@@ -2997,6 +3147,16 @@ def _run_all(root: Path, pipes: dict, resume: bool = False) -> dict:
                     "연다. round 가 빌 때까지 반복한다"}
 
 
+def _skip_gates(root: Path, pipe: dict, persist: bool = True) -> None:
+    """`run --no-gate` — 사용자가 이번 run 에서 승인 지점을 건너뛰라고 한 것이다.
+    이미 승인을 기다리는 중이면 그 대기도 사용자의 명시적 지시로 풀린다."""
+    pipe["gatesOff"] = True
+    if (pipe.get("carry") or {}).get("pendingApproval"):
+        resolve_approval(pipe, {"approve": True}, by="no-gate")
+    if persist:
+        _persist_pipeline(root, pipe, focus=False)
+
+
 def cmd_run(args) -> dict:
     root = Path(args.path).resolve()
     if not (root / ".sdd" / "state.json").exists():
@@ -3023,7 +3183,11 @@ def cmd_run(args) -> dict:
                     "pipelines": sorted(pipes)}
         return reopen_pipeline(root, pipe, from_stage, getattr(args, "depth", None))
 
+    no_gate = bool(getattr(args, "no_gate", False))
     if all_mode and not feature:
+        if no_gate:
+            for p in live_pipelines(pipes).values():
+                _skip_gates(root, p)
         return _run_all(root, pipes, resume=bool(getattr(args, "resume", False)))
 
     # 새 기능이면 그 슬러그의 파이프라인을 본다. 다른 기능이 돌고 있어도 막지 않는다 —
@@ -3057,6 +3221,8 @@ def cmd_run(args) -> dict:
             pipe["haltReason"] = None
             pipe["attempts"] = {k: 0 for k in pipe["attempts"]}
         _record(pipe, "revived" if revived else "resumed")
+        if no_gate:
+            _skip_gates(root, pipe, persist=False)
         _persist_pipeline(root, pipe)
         return {"ok": True, "resumed": True, "slug": pipe["slug"],
                 "pipeline": pipeline_summary(pipe),
@@ -3082,6 +3248,7 @@ def cmd_run(args) -> dict:
 
     pipe = _new_pipeline(feature, slug, args.max_attempts)
     pipe["forcedDepth"] = getattr(args, "depth", None)
+    pipe["gatesOff"] = no_gate
 
     config = load_config(root)
     # 같은 슬러그를 다시 여는 길이다. 아래 refresh_roster 보다 먼저 꺼내야 깊이가
@@ -3238,7 +3405,12 @@ def cmd_advance(args) -> dict:
 
     stage_before = pipe.get("stage")
 
-    if pipe.get("status") == "awaiting-user":
+    if pipe.get("status") == "awaiting-user" and pipe["carry"].get("pendingApproval"):
+        err = resolve_approval(pipe, result)
+        if err:
+            return {"ok": False, "reason": err, "pipeline": pipeline_summary(pipe),
+                    "next": compute_next(root, target)}
+    elif pipe.get("status") == "awaiting-user":
         pipe["carry"]["userAnswers"] = result.get("answers") or result
         pipe["carry"]["openQuestions"] = []
         pipe["status"] = "running"
@@ -3399,6 +3571,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--all", action="store_true",
                     help="살아 있는 파이프라인 전부를 대상으로 배치 루프를 연다 "
                          "(--resume 과 함께 주면 halted 인 것도 되살린다)")
+    sp.add_argument("--no-gate", dest="no_gate", action="store_true",
+                    help="이 run 에서 사람 승인 지점(humanGates)을 건너뛴다 — 사용자가 "
+                         "명시적으로 원할 때만")
     wt = sp.add_mutually_exclusive_group()
     wt.add_argument("--worktree", dest="worktree", action="store_true", default=None,
                     help="이 기능만 워크트리에서 작업한다 (config 설정을 덮어쓴다)")

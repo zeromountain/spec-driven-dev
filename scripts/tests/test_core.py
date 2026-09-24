@@ -55,7 +55,9 @@ createdAt: 2026-08-27T00:00:00Z
 # 프론트매터 교차검증이 걸리지 않도록 하는 경로 (feature/version 과 일치)
 VALID_SPEC_PATH = "specs/테스트-기능/spec-v1.md"
 
-DEFAULT_CONFIG = dict(sdd.DEFAULT_CONFIG)
+# 기존 테스트는 파이프라인 전이 자체를 본다 — 사람 승인 지점은 GateTests 가 따로 켠다.
+NO_GATES = {"spec": False, "plan": False}
+DEFAULT_CONFIG = dict(sdd.DEFAULT_CONFIG, humanGates=NO_GATES)
 
 
 class ValidateSpecTests(unittest.TestCase):
@@ -436,10 +438,25 @@ def _ns(**kwargs):
     return ns
 
 
-def _init_project(tmp: str) -> Path:
+def _set_gates(root: Path, gates) -> None:
+    cfg = sdd.read_json(root / ".sdd" / "config.json")
+    cfg["humanGates"] = dict(gates)
+    sdd.write_json(root / ".sdd" / "config.json", cfg)
+
+
+def _init(ns):
+    """sdd.cmd_init + 사람 승인 지점 끄기 (전이 테스트용)."""
+    out = sdd.cmd_init(ns)
+    _set_gates(Path(ns.path), NO_GATES)
+    return out
+
+
+def _init_project(tmp: str, gates=None) -> Path:
     root = Path(tmp)
-    sdd.cmd_init(_ns(path=str(root), enforce=False, specs=None, src=None, tests=None,
-                     worktrees=False))
+    _init(_ns(path=str(root), enforce=False, specs=None, src=None, tests=None,
+              worktrees=False))
+    if gates is not None:
+        _set_gates(root, gates)
     return root
 
 
@@ -449,7 +466,8 @@ def _run(root: Path, feature=None, **kw):
                            max_attempts=kw.get("max_attempts", sdd.DEFAULT_MAX_ATTEMPTS),
                            depth=kw.get("depth"), spec=kw.get("spec"),
                            all=kw.get("all", False), worktree=kw.get("worktree"),
-                           from_stage=kw.get("from_stage")))
+                           from_stage=kw.get("from_stage"),
+                           no_gate=kw.get("no_gate", False)))
 
 
 def _next(root: Path, spec=None, all=False):
@@ -1099,7 +1117,7 @@ class ParallelPipelineTests(unittest.TestCase):
 
     def _two(self, tmp, enforce=False):
         root = Path(tmp)
-        sdd.cmd_init(_ns(path=str(root), enforce=enforce, specs=None, src=None, tests=None))
+        _init(_ns(path=str(root), enforce=enforce, specs=None, src=None, tests=None))
         _run(root, "기능 하나")
         _run(root, "기능 둘")
         return root
@@ -1176,7 +1194,7 @@ class ParallelPipelineTests(unittest.TestCase):
         """현재 페이즈에서 아무도 못 움직이면 게이트가 기다리는 쪽으로 넘어간다."""
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            sdd.cmd_init(_ns(path=str(root), enforce=True, specs=None, src=None,
+            _init(_ns(path=str(root), enforce=True, specs=None, src=None,
                              tests=None, worktrees=False))
             _run(root, "기능 하나")
             spec_rel = _next(root)["context"]["specPath"]
@@ -1190,7 +1208,7 @@ class ParallelPipelineTests(unittest.TestCase):
     def test_overlapping_implement_files_serialize(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            sdd.cmd_init(_ns(path=str(root), enforce=False, specs=None, src=None,
+            _init(_ns(path=str(root), enforce=False, specs=None, src=None,
                              tests=None, worktrees=False))
             for name in ("기능 하나", "기능 둘"):
                 _run(root, name)
@@ -1210,7 +1228,7 @@ class ParallelPipelineTests(unittest.TestCase):
     def test_disjoint_implement_files_run_together(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            sdd.cmd_init(_ns(path=str(root), enforce=False, specs=None, src=None,
+            _init(_ns(path=str(root), enforce=False, specs=None, src=None,
                              tests=None, worktrees=False))
             for name in ("기능 하나", "기능 둘"):
                 _run(root, name)
@@ -1229,7 +1247,7 @@ class ParallelPipelineTests(unittest.TestCase):
         """계획이 없으면 파일 범위를 모른다 — 추측으로 동시에 돌리지 않는다."""
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            sdd.cmd_init(_ns(path=str(root), enforce=False, specs=None, src=None,
+            _init(_ns(path=str(root), enforce=False, specs=None, src=None,
                              tests=None, worktrees=False))
             for name in ("기능 하나", "기능 둘"):
                 _run(root, name)
@@ -1330,7 +1348,7 @@ def _git_project(tmp: str, enforce=False, worktrees=True) -> Path:
     for args in (["init", "-q"], ["config", "user.email", "t@t"],
                  ["config", "user.name", "t"], ["add", "-A"], ["commit", "-qm", "init"]):
         subprocess.run(["git", "-C", str(root), *args], check=True, capture_output=True)
-    sdd.cmd_init(_ns(path=str(root), enforce=enforce, specs=None, src=None,
+    _init(_ns(path=str(root), enforce=enforce, specs=None, src=None,
                      tests=None, worktrees=worktrees))
     return root
 
@@ -1491,7 +1509,7 @@ class WorktreeTests(unittest.TestCase):
         """git 이 아니어도 파이프라인은 돌아야 한다 — 다만 그 사실을 숨기지 않는다."""
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            sdd.cmd_init(_ns(path=str(root), enforce=False, specs=None, src=None,
+            _init(_ns(path=str(root), enforce=False, specs=None, src=None,
                              tests=None, worktrees=True))
             out = _run(root, "기능 하나")
             self.assertTrue(out["ok"])
@@ -2025,6 +2043,165 @@ class VerifyCommandTests(unittest.TestCase):
             report = (root / after["next"]["agents"][0]["context"]["reviewPath"]).read_text(encoding="utf-8")
             self.assertIn("`pytest -k AC_2`", report)
             self.assertNotIn("{{verifyRows}}", report)
+
+
+class HumanGateTests(unittest.TestCase):
+    """사람 승인 지점 — 설계는 사람이 판단하고, 모델은 대신 승인하지 않는다."""
+
+    SPEC_ON = {"spec": True, "plan": False}
+
+    def _to_spec_gate(self, root, **kw):
+        spec_rel = _run(root, "테스트 기능", **kw)["next"]["context"]["specPath"]
+        _write_valid_spec(root, spec_rel)
+        return _advance(root, {"openQuestions": [], "assumptions": ["ASSUMPTION: 한 사용자"]})
+
+    def test_default_config_gates_spec_only(self):
+        self.assertEqual(sdd.DEFAULT_CONFIG["humanGates"], {"spec": True, "plan": False})
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sdd.cmd_init(_ns(path=str(root), enforce=False, specs=None, src=None,
+                             tests=None, worktrees=False))
+            after = self._to_spec_gate(root)
+            self.assertEqual(after["next"]["action"], "approve")
+
+    def test_valid_spec_waits_for_approval_with_deterministic_summary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(tmp, gates=self.SPEC_ON)
+            nxt = self._to_spec_gate(root)["next"]
+            self.assertEqual(nxt["action"], "approve")
+            self.assertEqual(nxt["gate"], "spec")
+            self.assertTrue(nxt["path"].endswith("spec-v1.md"))
+            summary = nxt["summary"]
+            self.assertEqual(len(summary["acceptanceCriteria"]), 2)
+            self.assertTrue(summary["acceptanceCriteria"][0].startswith("AC-1:"))
+            self.assertEqual(summary["outOfScope"], ["인증 기능은 다루지 않는다."])
+            self.assertEqual(summary["assumptions"], ["ASSUMPTION: 한 사용자"])
+            # 다시 불러도 같은 대기 상태 (next 는 멱등)
+            self.assertEqual(_next(root)["action"], "approve")
+
+    def test_approve_enters_implement(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(tmp, gates=self.SPEC_ON)
+            self._to_spec_gate(root)
+            after = _advance(root, {"approve": True})
+            self.assertTrue(after["ok"])
+            self.assertEqual(after["next"]["stage"], "implement")
+            self.assertEqual(after["next"]["agent"], "software-engineer")
+
+    def test_feedback_reopens_same_version_without_spending_attempts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(tmp, gates=self.SPEC_ON)
+            self._to_spec_gate(root)
+            after = _advance(root, {"feedback": ["AC-2 에 수치를 넣어라"]})
+            nxt = after["next"]
+            self.assertEqual(nxt["agent"], "spec-architect")
+            self.assertEqual(nxt["context"]["userFeedback"], ["AC-2 에 수치를 넣어라"])
+            self.assertTrue(nxt["context"]["specPath"].endswith("spec-v1.md"))
+            self.assertIn("userFeedback", nxt["instruction"])
+            self.assertEqual(after["pipeline"]["attempts"]["spec"], 0)
+            # 고친 명세는 다시 승인을 받아야 한다
+            again = _advance(root, {"openQuestions": []})
+            self.assertEqual(again["next"]["action"], "approve")
+            self.assertEqual(again["next"]["gate"], "spec")
+
+    def test_malformed_answer_is_rejected_without_changing_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(tmp, gates=self.SPEC_ON)
+            self._to_spec_gate(root)
+            bad = _advance(root, {"answers": {"q": "a"}})
+            self.assertFalse(bad["ok"])
+            self.assertEqual(_next(root)["action"], "approve")
+
+    def test_new_spec_version_requires_new_approval(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(tmp, gates=self.SPEC_ON)
+            self._to_spec_gate(root)
+            _advance(root, {"approve": True})
+            back = _advance(root, {"specChangeRequests": ["AC-3 추가"]})
+            spec_rel = back["next"]["context"]["specPath"]
+            self.assertTrue(spec_rel.endswith("spec-v2.md"))
+            _write_valid_spec(root, spec_rel, version=2)
+            after = _advance(root, {"openQuestions": []})
+            self.assertEqual(after["next"]["action"], "approve")
+
+    def test_no_gate_skips_and_releases_pending_approval(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(tmp, gates=self.SPEC_ON)
+            after = self._to_spec_gate(root, no_gate=True)
+            self.assertEqual(after["next"]["stage"], "implement")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(tmp, gates=self.SPEC_ON)
+            self._to_spec_gate(root)
+            resumed = _run(root, resume=True, no_gate=True)
+            self.assertEqual(resumed["next"]["stage"], "implement")
+            self.assertTrue(resumed["pipeline"]["gatesOff"])
+
+    def test_plan_gate_and_feedback_rerun_planner(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(tmp, gates={"spec": False, "plan": True})
+            _run(root, "테스트 기능", depth="deep")
+            _write_valid_spec(root, _next(root)["context"]["specPath"])
+            _advance(root, {"openQuestions": []})
+            plan = {"tasks": [{"id": "T-1", "acs": ["AC-1"], "files": ["src/a.py"],
+                               "verify": "pytest -k AC_1"}]}
+            nxt = _advance(root, plan)["next"]
+            self.assertEqual((nxt["action"], nxt["gate"]), ("approve", "plan"))
+            self.assertEqual(nxt["summary"]["files"], ["src/a.py"])
+            self.assertTrue(nxt["path"].endswith("tasks.md"))
+
+            nxt = _advance(root, {"feedback": "T-1 을 둘로 쪼개라"})["next"]
+            self.assertEqual(nxt["agent"], "impl-planner")
+            self.assertEqual(nxt["context"]["userFeedback"], ["T-1 을 둘로 쪼개라"])
+
+            nxt = _advance(root, plan)["next"]
+            self.assertEqual(nxt["action"], "approve")
+            nxt = _advance(root, {"approve": True})["next"]
+            self.assertEqual(nxt["agent"], "software-engineer")
+
+    def test_partial_gate_config_keeps_other_defaults(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(tmp, gates={"plan": True})
+            pipe = {"gatesOff": False}
+            self.assertTrue(sdd.human_gate_on(root, pipe, "spec"))
+            self.assertTrue(sdd.human_gate_on(root, pipe, "plan"))
+
+    def test_awaiting_approval_does_not_block_other_pipelines(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(tmp, gates=self.SPEC_ON)
+            self._to_spec_gate(root)
+            _run(root, "다른 기능")
+            batch = _next(root, all=True)
+            actions = {a["slug"]: a["action"] for a in batch["round"]}
+            self.assertEqual(actions["테스트-기능"], "approve")
+            self.assertEqual(actions["다른-기능"], "call-agent")
+            row = next(r for r in batch["board"]["pipelines"] if r["slug"] == "테스트-기능")
+            self.assertEqual(row["pendingApproval"], "spec")
+
+    def test_awaiting_approval_does_not_hold_the_phase_under_enforce(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(tmp, gates=self.SPEC_ON)
+            sdd.update_state(root, lambda st: st.update({"enforce": True}))
+            spec_rel = _run(root, "테스트 기능")["next"]["context"]["specPath"]
+            other_rel = _run(root, "다른 기능", no_gate=True)["next"]["context"]["specPath"]
+            _write_valid_spec(root, spec_rel)
+            _advance(root, {"openQuestions": []}, spec="테스트-기능")  # → approve 대기 (phase spec)
+            _write_valid_spec(root, other_rel)
+            _advance(root, {"openQuestions": []}, spec="다른-기능")   # → implement
+            batch = _next(root, all=True)
+            actions = {a["slug"]: a["action"] for a in batch["round"]}
+            self.assertEqual(actions, {"다른-기능": "call-agent", "테스트-기능": "approve"})
+            self.assertEqual(batch["waiting"], [])
+
+    def test_reopening_spec_stage_clears_approval(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(tmp, gates=self.SPEC_ON)
+            self._to_spec_gate(root)
+            _advance(root, {"approve": True})
+            reopened = _run(root, from_stage="spec", spec="테스트-기능")
+            self.assertTrue(reopened["ok"])
+            _write_valid_spec(root, reopened["next"]["context"]["specPath"])
+            after = _advance(root, {"openQuestions": []})
+            self.assertEqual(after["next"]["action"], "approve")
 
 
 if __name__ == "__main__":

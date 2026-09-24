@@ -1,6 +1,6 @@
 ---
 description: 명세→구현→리뷰 파이프라인을 끝까지 자동으로 돌린다 (--all 이면 전부 동시에)
-argument-hint: [기능 설명] [--all] [--deep|--light] (비우면 하나 재개, --all 이면 전부)
+argument-hint: [기능 설명] [--all] [--deep|--light] [--no-gate] (비우면 하나 재개, --all 이면 전부)
 ---
 
 `spec-driven-dev` 스킬을 **run 모드**로 실행한다. 대상: **$ARGUMENTS**
@@ -12,9 +12,12 @@ argument-hint: [기능 설명] [--all] [--deep|--light] (비우면 하나 재개
   마지막에 손댄 **하나만** 재개한다.
 - `--deep`/`--light`는 `--depth`로 넘긴다. 시작 응답의 `depth`(깊이·`deepReasons`·
   `agentCount`)를 사용자에게 한 줄로 먼저 알린다.
+- `--no-gate`는 그대로 넘긴다 — 이 run에서 사람 승인 지점을 건너뛴다. 사용자가 직접 준
+  경우에만 쓴다.
 
 그다음 `next`(단일) 또는 `next --all`(배치)가 시키는 행동을 하고 결과를 `advance`에 넘기는
 루프를 끝까지 돌린다. **다음 단계도, 누구를 부를지도, 무엇을 동시에 해도 되는지도 직접
 판단하지 마라** — 전부 스크립트가 정한다. 자세한 계약은 스킬의 1단계·1.5단계를 따른다.
 
-단계 사이에서 계속할지 묻지 말고, `ask-user`와 `halted`일 때만 멈춰서 보고한다.
+단계 사이에서 계속할지 묻지 말고, `ask-user`·`approve`·`halted`일 때만 멈춰서 보고한다.
+`approve`는 네가 대신 승인하지 않는다.

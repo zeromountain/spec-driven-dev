@@ -129,6 +129,12 @@ Codex에는 슬래시 커맨드가 없으므로 **의도를 말로 전한다.** 
 깊이를 직접 정하려면 "깊게" / "가볍게"를 덧붙인다(`--deep`/`--light`에 대응). 진행 위치는
 `.sdd/state.json`에 남으므로 세션이 끊겨도 "아까 하던 거 이어서"로 같은 자리에서 이어진다.
 
+**v0.16.0부터 명세가 완성되면 한 번 멈춘다.** 파이프라인이 명세 요약(인수 기준·오류 케이스·
+범위 밖·가정)을 보여주고 승인을 기다린다 — 승인하면 구현으로 가고, 고칠 점을 말하면 같은
+명세에 반영돼 다시 돌아온다. 끄려면 `.sdd/config.json`에
+`"humanGates": {"spec": false, "plan": false}`를 넣고, 한 번만 건너뛰려면
+`/sdd:run <설명> --no-gate`. 구현 계획(깊은 모드)도 승인받으려면 `"plan": true`.
+
 `init`은 다음을 만든다: `specs/`, `.sdd/state.json`(세션 로컬, gitignore됨),
 `.sdd/config.json`(팀 공유, 커밋됨), `.sdd/reviews/`, 프로젝트 지식 양식 `docs/sdd/prd.md`·
 `docs/sdd/architecture.md`·`docs/sdd/adr/_template.md`(없을 때만 — 채워 두면 모든 에이전트가
